@@ -211,7 +211,7 @@ func (m *SecretsModule) scanJSFiles(ctx context.Context, domain string, outDir s
 
 	secretCount := 0
 	for _, jsURL := range jsURLs {
-		cmd := exec.CommandContext(ctx, "curl", "-s", "-L", "--max-time", "10", jsURL)
+		cmd := exec.CommandContext(ctx, "curl", "-s", "-L", "--max-time", "20", jsURL)
 		content, err := cmd.Output()
 		if err != nil {
 			continue
