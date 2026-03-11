@@ -31,7 +31,18 @@
 
 # Build
 
+    go mod tidy
     go build -ldflags="-s -w" -o reconstorm .
+
+# System-wide use (optional)
+
+    sudo cp reconstorm /usr/local/bin/
+
+# Cross-compile
+
+    GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o reconstorm-linux .
+    GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o reconstorm-mac .
+    GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o reconstorm.exe .    
 
 # Run
 
