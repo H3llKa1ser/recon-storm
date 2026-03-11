@@ -21,3 +21,44 @@
     │   ├── secrets.go              # Secret discovery
     │   └── screenshots.go          # Visual recon
     └── pkg/reporter/reporter.go    # Report generation
+
+### 2) Installation
+
+# Clone
+
+    git clone https://github.com/H3llKa1ser/recon-storm.git
+    cd /recon-storm
+
+# Build
+
+    go build -ldflags="-s -w" -o reconstorm .
+
+# Run
+
+    ./reconstorm -d example.com
+
+### 3) Usage
+
+# Basic scan
+
+    ./reconstorm -d example.com
+
+# Domain list + custom output
+
+    ./reconstorm -dL targets.txt -o ./results -t 100
+
+# Passive only
+
+    ./reconstorm -d example.com -passive
+
+# Specific modules
+
+    ./reconstorm -d example.com -modules subdomains,dns,web
+
+# With API keys
+
+    ./reconstorm -d example.com -shodan-key KEY -vt-key KEY
+
+# Resume interrupted scan
+
+    ./reconstorm -d example.com -o ./recon-example.com-20260311 -resume
