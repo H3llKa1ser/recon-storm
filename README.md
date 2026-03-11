@@ -5,31 +5,19 @@
 ### 1) Architecture
 
     recon-storm/
-    ├── go.mod
-    ├── go.sum
-    ├── main.go                    # Entry point, signal handling, crash recovery
-    ├── pkg/
-    │   ├── config/
-    │   │   └── config.go          # Configuration management
-    │   ├── installer/
-    │   │   └── installer.go       # Auto-installs all required tools
-    │   ├── logger/
-    │   │   └── logger.go          # Structured logging
-    │   ├── state/
-    │   │   └── state.go           # Persistent state for crash recovery
-    │   ├── scanner/
-    │   │   ├── scanner.go         # Scanner orchestrator
-    │   │   ├── subdomain.go       # Subdomain enumeration
-    │   │   ├── port.go            # Port scanning
-    │   │   ├── web.go             # Web probing & tech detection
-    │   │   ├── dns.go             # DNS resolution & zone transfers
-    │   │   ├── vuln.go            # Vulnerability scanning
-    │   │   ├── endpoints.go       # URL/endpoint discovery
-    │   │   ├── secrets.go         # Secret/sensitive file discovery
-    │   │   └── screenshots.go     # Visual recon
-    │   └── reporter/
-    │       └── reporter.go        # HTML/JSON/Markdown report generation
-    ├── templates/
-    │   └── report.html            # HTML report template
-    └── wordlists/
-        └── README.md              # Wordlist instructions
+    ├── main.go                     # Entry point, signal handling
+    ├── pkg/config/config.go        # Configuration
+    ├── pkg/installer/installer.go  # Auto tool installation
+    ├── pkg/logger/logger.go        # Structured logging
+    ├── pkg/state/state.go          # Persistent state & crash recovery
+    ├── pkg/scanner/
+    │   ├── scanner.go              # Orchestrator
+    │   ├── subdomain.go            # Subdomain enumeration
+    │   ├── dns.go                  # DNS resolution & zone transfers
+    │   ├── port.go                 # Port scanning
+    │   ├── web.go                  # Web probing & tech detection
+    │   ├── endpoints.go            # URL/endpoint discovery
+    │   ├── vuln.go                 # Vulnerability scanning
+    │   ├── secrets.go              # Secret discovery
+    │   └── screenshots.go          # Visual recon
+    └── pkg/reporter/reporter.go    # Report generation
