@@ -44,7 +44,6 @@ func (m *VulnModule) Run(ctx context.Context, domain string) error {
 	if _, err := exec.LookPath("nuclei"); err == nil {
 		m.log.Info("  Running Nuclei vulnerability scan...")
 
-		nucleiOut := filepath.Join(outDir, "nuclei_results.txt")
 		nucleiJSON := filepath.Join(outDir, "nuclei_results.json")
 
 		cmd := exec.CommandContext(ctx, "nuclei",
@@ -55,8 +54,8 @@ func (m *VulnModule) Run(ctx context.Context, domain string) error {
 			"-rl", "150",
 			"-timeout", "10",
 			"-retries", "2",
-			"-o", nucleiOut,
-			"-json", "-output", nucleiJSON,
+			"-j",
+			"-o", nucleiJSON,
 			"-silent",
 			"-stats",
 		)
@@ -68,7 +67,7 @@ func (m *VulnModule) Run(ctx context.Context, domain string) error {
 
 		m.parseNucleiResults(nucleiJSON, domain)
 
-		results := readLines(nucleiOut)
+		results := readLines(nucleiJSON)
 		m.log.Success("  Nuclei found %d potential vulnerabilities", len(results))
 	} else {
 		m.log.Warn("  Nuclei not found — install: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest")
