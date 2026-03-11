@@ -22,7 +22,7 @@ const banner = `
 ╠╦╝├┤ │  │ ││││╚═╗ │ │ │├┬┘│││
 ╩╚═└─┘└─┘└─┘┘└┘╚═╝ ┴ └─┘┴└─┴ ┴
     Bug Bounty Recon Framework v1.0
-    github.com/H3llKa1ser/B00t2R00t
+    github.com/H3llKa1ser/recon-storm
     Crash-Resilient • Auto-Install • Full Reports
 `
 
