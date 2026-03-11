@@ -30,16 +30,14 @@ func (m *WebModule) Run(ctx context.Context, domain string) error {
 	outDir := filepath.Join(m.cfg.OutputDir, domain, "web")
 	os.MkdirAll(outDir, 0755)
 
+	// Prefer host:port pairs from port scan, fall back to all_subdomains.
+	// Check content, not just existence — upstream modules may create empty files.
 	inputFile := filepath.Join(m.cfg.OutputDir, domain, "ports", "host_ports.txt")
-	if _, err := os.Stat(inputFile); os.IsNotExist(err) {
+	if lines := readLines(inputFile); len(lines) == 0 {
 		inputFile = filepath.Join(m.cfg.OutputDir, domain, "subdomains", "all_subdomains.txt")
 	}
 
-	if _, err := os.Stat(inputFile); os.IsNotExist(err) {
-		return fmt.Errorf("no input file found for web probing")
-	}
-
-	// Empty-input guard
+	// Final check
 	if _, ok := readLinesOrWarn(inputFile, m.log, "web"); !ok {
 		return nil
 	}
@@ -49,9 +47,11 @@ func (m *WebModule) Run(ctx context.Context, domain string) error {
 	if isGoHttpx {
 		m.log.Info("  Running httpx web probe...")
 
-		httpxOut := filepath.Join(outDir, "httpx_results.txt")
 		httpxJSON := filepath.Join(outDir, "httpx_results.json")
 
+		// Use JSON lines output mode (-j) with a single -o flag.
+		// httpx does not support dual output (-o for text AND -output for JSON)
+		// in the same invocation — this causes one to be empty.
 		cmd := exec.CommandContext(ctx, httpxPath,
 			"-l", inputFile,
 			"-sc",
@@ -69,8 +69,8 @@ func (m *WebModule) Run(ctx context.Context, domain string) error {
 			"-threads", fmt.Sprintf("%d", m.cfg.Threads),
 			"-follow-redirects",
 			"-silent",
-			"-o", httpxOut,
-			"-json", "-output", httpxJSON,
+			"-j",
+			"-o", httpxJSON,
 		)
 
 		output, err := cmd.CombinedOutput()
@@ -78,17 +78,15 @@ func (m *WebModule) Run(ctx context.Context, domain string) error {
 			m.log.Warn("  httpx error: %v — %s", err, string(output))
 		}
 
-		m.parseHttpxResults(httpxJSON, domain)
+		// Parse JSON results and extract live URLs
+		urls := m.parseHttpxResults(httpxJSON, domain)
 
-		lines := readLines(httpxOut)
 		liveURLFile := filepath.Join(outDir, "live_urls.txt")
-		var urls []string
-		for _, line := range lines {
-			if line != "" {
-				urls = append(urls, line)
-			}
-		}
 		writeLines(liveURLFile, urls)
+
+		// Also write a human-readable text version
+		httpxOut := filepath.Join(outDir, "httpx_results.txt")
+		writeLines(httpxOut, urls)
 
 		m.log.Success("  httpx found %d live web servers", len(urls))
 	} else if httpxPath != "" {
@@ -133,8 +131,10 @@ func findGoHttpx() (string, bool) {
 	return path, false
 }
 
-func (m *WebModule) parseHttpxResults(jsonFile string, domain string) {
+// parseHttpxResults parses the JSONL output from httpx and returns discovered URLs
+func (m *WebModule) parseHttpxResults(jsonFile string, domain string) []string {
 	lines := readLines(jsonFile)
+	var urls []string
 
 	for _, line := range lines {
 		var result map[string]interface{}
@@ -143,6 +143,11 @@ func (m *WebModule) parseHttpxResults(jsonFile string, domain string) {
 		}
 
 		url, _ := result["url"].(string)
+		if url == "" {
+			continue
+		}
+		urls = append(urls, url)
+
 		statusCode := ""
 		if sc, ok := result["status_code"].(float64); ok {
 			statusCode = fmt.Sprintf("%.0f", sc)
@@ -170,4 +175,6 @@ func (m *WebModule) parseHttpxResults(jsonFile string, domain string) {
 			},
 		})
 	}
+
+	return urls
 }
