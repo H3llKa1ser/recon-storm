@@ -30,16 +30,14 @@ func (m *PortModule) Run(ctx context.Context, domain string) error {
 	outDir := filepath.Join(m.cfg.OutputDir, domain, "ports")
 	os.MkdirAll(outDir, 0755)
 
+	// Prefer live_hosts from DNS resolution, fall back to all_subdomains.
+	// Check both existence AND content — dnsx may create an empty file.
 	inputFile := filepath.Join(m.cfg.OutputDir, domain, "dns", "live_hosts.txt")
-	if _, err := os.Stat(inputFile); os.IsNotExist(err) {
+	if lines := readLines(inputFile); len(lines) == 0 {
 		inputFile = filepath.Join(m.cfg.OutputDir, domain, "subdomains", "all_subdomains.txt")
 	}
 
-	if _, err := os.Stat(inputFile); os.IsNotExist(err) {
-		return fmt.Errorf("no input hosts file found")
-	}
-
-	// Empty-input guard
+	// Final check: do we have any input at all?
 	if _, ok := readLinesOrWarn(inputFile, m.log, "ports"); !ok {
 		return nil
 	}
