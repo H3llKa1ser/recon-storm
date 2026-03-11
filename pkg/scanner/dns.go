@@ -48,6 +48,7 @@ func (m *DNSModule) Run(ctx context.Context, domain string) error {
 		dnsxOut := filepath.Join(outDir, "dnsx_resolved.txt")
 		dnsxJSON := filepath.Join(outDir, "dnsx_full.json")
 
+		// Run dnsx in plain-text mode for the resolved hosts file
 		cmd := exec.CommandContext(ctx, "dnsx",
 			"-l", subsFile,
 			"-resp",
@@ -55,11 +56,24 @@ func (m *DNSModule) Run(ctx context.Context, domain string) error {
 			"-retry", "3",
 			"-t", fmt.Sprintf("%d", m.cfg.Threads),
 			"-o", dnsxOut,
-			"-json", "-jo", dnsxJSON,
 		)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			m.log.Warn("  dnsx error: %v — %s", err, string(output))
+		}
+
+		// Also run in JSON mode for detailed records (separate pass)
+		cmdJSON := exec.CommandContext(ctx, "dnsx",
+			"-l", subsFile,
+			"-resp",
+			"-a", "-aaaa", "-cname", "-mx", "-ns", "-txt",
+			"-retry", "3",
+			"-t", fmt.Sprintf("%d", m.cfg.Threads),
+			"-j",
+			"-o", dnsxJSON,
+		)
+		if jsonOut, jsonErr := cmdJSON.CombinedOutput(); jsonErr != nil {
+			m.log.Debug("  dnsx JSON pass error: %v — %s", jsonErr, string(jsonOut))
 		}
 
 		resolved := readLines(dnsxOut)
