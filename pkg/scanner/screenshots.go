@@ -42,12 +42,14 @@ func (m *ScreenshotsModule) Run(ctx context.Context, domain string) error {
 	if _, err := exec.LookPath("gowitness"); err == nil {
 		m.log.Info("  Running gowitness screenshots...")
 
+		// gowitness v3 syntax: gowitness scan file -f <file> [flags]
+		// v2 used: gowitness file -f <file> -P <dir> --threads N
 		cmd := exec.CommandContext(ctx, "gowitness",
-			"file",
+			"scan", "file",
 			"-f", liveURLsFile,
-			"-P", outDir,
-			"--threads", fmt.Sprintf("%d", m.cfg.Threads),
-			"--timeout", "15",
+			"-s", outDir,
+			"-t", fmt.Sprintf("%d", m.cfg.Threads),
+			"-T", "15",
 		)
 
 		output, err := cmd.CombinedOutput()
