@@ -47,11 +47,12 @@ func (m *WebModule) Run(ctx context.Context, domain string) error {
 	if isGoHttpx {
 		m.log.Info("  Running httpx web probe...")
 
+		httpxOut := filepath.Join(outDir, "httpx_results.txt")
 		httpxJSON := filepath.Join(outDir, "httpx_results.json")
 
-		// Use JSON lines output mode (-j) with a single -o flag.
-		// httpx does not support dual output (-o for text AND -output for JSON)
-		// in the same invocation — this causes one to be empty.
+		// Run httpx in PLAIN TEXT mode first — this is the most reliable
+		// output path and what downstream modules depend on. The -j flag
+		// combined with -o is buggy in httpx v1.7.x (empty output files).
 		cmd := exec.CommandContext(ctx, httpxPath,
 			"-l", inputFile,
 			"-sc",
@@ -69,8 +70,7 @@ func (m *WebModule) Run(ctx context.Context, domain string) error {
 			"-threads", fmt.Sprintf("%d", m.cfg.Threads),
 			"-follow-redirects",
 			"-silent",
-			"-j",
-			"-o", httpxJSON,
+			"-o", httpxOut,
 		)
 
 		output, err := cmd.CombinedOutput()
@@ -78,15 +78,36 @@ func (m *WebModule) Run(ctx context.Context, domain string) error {
 			m.log.Warn("  httpx error: %v — %s", err, string(output))
 		}
 
-		// Parse JSON results and extract live URLs
-		urls := m.parseHttpxResults(httpxJSON, domain)
-
+		// Extract URLs from plain text output (first field before any space/tab)
+		lines := readLines(httpxOut)
 		liveURLFile := filepath.Join(outDir, "live_urls.txt")
+		var urls []string
+		for _, line := range lines {
+			// httpx plain text: URL [status] [length] [title] ...
+			// The URL is the first whitespace-delimited field
+			parts := strings.Fields(line)
+			if len(parts) > 0 && (strings.HasPrefix(parts[0], "http://") || strings.HasPrefix(parts[0], "https://")) {
+				urls = append(urls, parts[0])
+			}
+		}
 		writeLines(liveURLFile, urls)
 
-		// Also write a human-readable text version
-		httpxOut := filepath.Join(outDir, "httpx_results.txt")
-		writeLines(httpxOut, urls)
+		// Run a second pass in JSON mode for structured data (best-effort)
+		cmdJSON := exec.CommandContext(ctx, httpxPath,
+			"-l", inputFile,
+			"-sc", "-cl", "-ct", "-title", "-server", "-td", "-cdn",
+			"-threads", fmt.Sprintf("%d", m.cfg.Threads),
+			"-follow-redirects",
+			"-silent",
+			"-j",
+			"-o", httpxJSON,
+		)
+		if jsonOut, jsonErr := cmdJSON.CombinedOutput(); jsonErr != nil {
+			m.log.Debug("  httpx JSON pass error: %v — %s", jsonErr, string(jsonOut))
+		}
+
+		// Parse JSON results into findings (best-effort — plain text already saved URLs)
+		m.parseHttpxResults(httpxJSON, domain)
 
 		m.log.Success("  httpx found %d live web servers", len(urls))
 	} else if httpxPath != "" {
@@ -131,10 +152,9 @@ func findGoHttpx() (string, bool) {
 	return path, false
 }
 
-// parseHttpxResults parses the JSONL output from httpx and returns discovered URLs
-func (m *WebModule) parseHttpxResults(jsonFile string, domain string) []string {
+// parseHttpxResults parses the JSONL output from httpx into state findings (best-effort)
+func (m *WebModule) parseHttpxResults(jsonFile string, domain string) {
 	lines := readLines(jsonFile)
-	var urls []string
 
 	for _, line := range lines {
 		var result map[string]interface{}
@@ -146,7 +166,6 @@ func (m *WebModule) parseHttpxResults(jsonFile string, domain string) []string {
 		if url == "" {
 			continue
 		}
-		urls = append(urls, url)
 
 		statusCode := ""
 		if sc, ok := result["status_code"].(float64); ok {
@@ -175,6 +194,4 @@ func (m *WebModule) parseHttpxResults(jsonFile string, domain string) []string {
 			},
 		})
 	}
-
-	return urls
 }
