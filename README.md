@@ -76,12 +76,12 @@
 
 ## TODO LATER:
 
-        I'm developing a bug bounty reconnaissance framework called ReconStorm, written in Go.
+    I'm developing a bug bounty reconnaissance framework called ReconStorm, written in Go.
     
     Repository: https://github.com/H3llKa1ser/recon-storm
     Go module path: github.com/H3llKa1ser/recon-storm
     
-    The framework is fully built, tested on live targets across multiple systems, and actively being improved.
+    The framework is fully built, tested on live targets across different systems, and actively being improved.
     
     ## Architecture
     
@@ -133,85 +133,98 @@
     - Runs apt-get update at start
     - Nuclei installs via GitHub Release FIRST (precompiled binary), falls back to go install
     
-    ## Multi-System Test Results
+    ## Test Results So Far
     
-    ### System 1: Target 21-school.ru (Kali Linux, had many tools pre-installed)
-    This was the first test, run BEFORE the installer was rewritten.
-    - Old installer only had 3 methods: go install, apt, brew
-    - 11 tools already installed, 0 newly installed, 4 required failures (subfinder, dnsx, naabu, nuclei)
-    - httpx bug discovered: Python httpx (encode/httpx) was in PATH instead of ProjectDiscovery httpx. The -l flag doesn't exist in Python httpx. This caused httpx to fail with "No such option: -l", resulting in 0 live web servers found
-    - The httpx failure cascaded: vulns module found 0, secrets had no targets, screenshots had no URLs
+    I have tested this tool on two different Kali Linux systems with different pre-installed tools, different apt source configurations, and different targets. The results need to be compared side-by-side to identify which issues are code bugs vs system-specific environment problems.
+    
+    ### Test 1: Kali Linux System A — Target: 21-school.ru
+    This was run with the OLD installer (only 3 methods: go install, apt, brew).
+    - System had many recon tools pre-installed (11 found)
+    - 0 tools auto-installed, 4 required failures (subfinder, dnsx, naabu, nuclei)
+    - CRITICAL BUG FOUND: Python httpx (encode/httpx) was in PATH instead of ProjectDiscovery httpx. Flag -l doesn't exist in Python httpx. httpx failed with "No such option: -l", resulting in 0 live web servers
+    - httpx failure cascaded downstream: vulns found 0, secrets had no targets, screenshots had no URLs
     - Subdomains worked well: amass (82), assetfinder (28), crt.sh (1) → 93 unique
-    - DNS zone transfer detection worked: found 2 vulnerable nameservers (ns1/ns2.21-school.ru)
-    - Port module was a silent no-op: Naabu missing, Nmap had no input, completed in 2ms with no results
-    - Endpoints module still worked via passive tools: waybackurls (5772), gau (49) → heavily relied on archive data
+    - DNS zone transfer detection worked: found 2 vulnerable nameservers (ns1/ns2.21-school.ru) — but may be false positives (check only validates response >100 bytes)
+    - Port module was a silent no-op: Naabu missing, Nmap had no input, completed in 2ms
+    - Endpoints worked via passive tools despite httpx failure: waybackurls (5772), gau (49)
     - Total scan time: 14m26s
-    - Key discovery: Zone transfer false positive potential — check only validates response >100 bytes, not actual zone data
     
-    ### System 2: Target scanme.nmap.org (Clean system, Go 1.24.1, minimal tools pre-installed)
-    This was run AFTER the installer rewrite with 9 fallback methods.
-    - Only 3 tools pre-installed (nmap, ffuf, amass), everything else installed from scratch
-    - 13 tools successfully auto-installed
-    - httpx conflict auto-resolved: Python version detected, ProjectDiscovery version installed via go install
-    - gowitness installed successfully via GitHub Release (previously failed via go install)
-    - Full pipeline working end-to-end: subdomains (4) → dns (2 resolved) → ports (nmap fallback) → web (1 live) → endpoints (1402) → vulns (2 findings) → secrets (11 findings) → screenshots (1 captured)
-    - Port module Nmap fallback worked correctly when Naabu was unavailable
-    - All 3 report formats generated (HTML, JSON, Markdown)
+    ### Test 2: Kali Linux System B — Target: scanme.nmap.org
+    This was run with the NEW installer (9 methods with GitHub Release downloader).
+    - Clean system, only 3 tools pre-installed (nmap, ffuf, amass)
+    - Go version: 1.24.1
+    - 13 tools successfully auto-installed from scratch
+    - httpx conflict auto-resolved: Python version detected and renamed, ProjectDiscovery version installed
+    - gowitness installed successfully via GitHub Release (previously failed via go install on System A)
+    - Full pipeline working: subdomains (4) → dns (2 resolved) → ports (nmap fallback) → web (1 live) → endpoints (1402) → vulns (2 findings) → secrets (11 findings) → screenshots (1 captured)
+    - Naabu failed: libpcap-dev unavailable via apt (exit status 100), GitHub Release downloaded but also failed
+    - Nuclei failed: GitHub Release downloaded v3.7.1 but binary didn't reach /usr/local/bin, go install also failed
+    - ALL apt-get install commands failed with exit status 100 (libpcap-dev, massdns, jq) — broken apt sources on this system
     - Total scan time: 6m37s
     
-    ### Cross-System Comparison
+    ### Side-by-Side Comparison
     
-    | Metric                    | System 1 (21-school.ru) | System 2 (scanme.nmap.org) |
-    |---------------------------|-------------------------|----------------------------|
-    | Installer version         | Old (3 methods)         | New (9 methods)            |
-    | Tools pre-installed       | 11                      | 3                          |
-    | Tools auto-installed      | 0                       | 13                         |
-    | Required tool failures    | 4                       | 2 (Naabu, Nuclei)         |
-    | httpx working             | ❌ Python version       | ✅ Auto-resolved           |
-    | Live web servers found    | 0 (httpx broken)        | 1 ✅                       |
-    | Port scanning             | Silent no-op            | Nmap fallback worked ✅    |
-    | Screenshots               | ❌ gowitness missing     | ✅ 1 captured              |
-    | Pipeline starvation       | Modules starved          | All modules fed ✅          |
-    | Reports generated         | ✅ All 3                | ✅ All 3                   |
+    | Metric                    | System A (21-school.ru)  | System B (scanme.nmap.org) |
+    |---------------------------|--------------------------|----------------------------|
+    | Installer version         | Old (3 methods)          | New (9 methods)            |
+    | Tools pre-installed       | 11                       | 3                          |
+    | Tools auto-installed      | 0                        | 13                         |
+    | Required tool failures    | 4                        | 2 (Naabu, Nuclei)         |
+    | httpx working             | ❌ Python version        | ✅ Auto-resolved           |
+    | Live web servers found    | 0 (httpx broken)         | 1 ✅                       |
+    | Port scanning             | Silent no-op             | Nmap fallback ✅            |
+    | Screenshots               | ❌ gowitness missing      | ✅ 1 captured              |
+    | Pipeline data flow        | Modules starved           | All modules fed ✅          |
+    | apt-get working           | Partially                | ❌ All exit status 100     |
+    | Reports generated         | ✅ All 3                 | ✅ All 3                   |
     
-    ### Issues that appeared on BOTH systems
+    ### Issues on BOTH systems
     - Nuclei fails to install (go install OOM/timeout, GitHub Release extraction issue)
-    - apt packages fail on some systems (exit status 100)
     - Findomain GitHub Release asset pattern doesn't match actual filenames
     - crt.sh parser is brittle (string splitting vs proper JSON parsing)
     
-    ### Issues that appeared on System 1 ONLY (fixed by rewrite)
-    - httpx Python conflict (FIXED: auto-detection + rename)
-    - Port module silent no-op (FIXED: Nmap fallback)
-    - Installer had no GitHub Release method (FIXED: full downloader added)
-    - No install failure logging (FIXED: warns on each attempt)
+    ### Fixed between System A → System B
+    - httpx conflict (FIXED: auto-detection + rename)
+    - Port module no-op (FIXED: Nmap fallback)
+    - Installer methods (FIXED: 3 → 9 methods)
+    - gowitness install (FIXED: GitHub Release works)
+    - Install failure logging (FIXED: warns per attempt)
     
-    ### Issues that appeared on System 2 ONLY
-    - libpcap-dev unavailable via apt (broken apt sources on that system)
-    - Naabu GitHub Release binary downloaded but may need libpcap.so at runtime
-    - trufflehog GitHub Release downloaded but didn't install (extraction/PATH issue)
-    - Nuclei GitHub Release downloaded v3.7.1 but binary didn't reach /usr/local/bin
+    ### System B only issues
+    - Broken apt sources (exit status 100 on everything)
+    - Naabu needs libpcap.so runtime dependency
+    - Nuclei/trufflehog GitHub Release download + extraction doesn't complete
     
-    ## Known Issues Still Open
-    1. Naabu fails to install — requires libpcap-dev which fails via apt on some systems. GitHub Release binary may also need libpcap.so at runtime. Need to add libpcap runtime detection or static binary download
-    2. Nuclei GitHub Release downloads but binary doesn't end up in PATH — needs debugging in findAndInstallBinary() or the zip extraction logic. Worked for gowitness but not nuclei
-    3. Findomain GitHub Release asset pattern "linux_amd64" doesn't match actual release filenames — need to check Findomain's actual release naming convention on their GitHub releases page
-    4. trufflehog GitHub Release downloaded but didn't install — same extraction/PATH issue as Nuclei potentially
-    5. crt.sh found 0 subdomains for scanme.nmap.org and only 1 for 21-school.ru — the JSON string-splitting parser is brittle, should use encoding/json proper parsing
-    6. Zone transfer check (dns.go) considers any AXFR response >100 bytes as successful — could produce false positives on System 1, should validate actual zone records
-    7. Zone transfers are not gated behind PassiveOnly flag — they are active techniques
-    8. No Shodan/Censys/VirusTotal API integration yet despite CLI flags existing
-    9. apt-get install fails with exit status 100 on some systems — installer should handle this more gracefully, perhaps checking apt sources validity first
+    ## I am now testing on a THIRD Kali Linux system.
+    
+    I will provide the full terminal output from this new system. Please:
+    1. Compare the results across all three systems
+    2. Identify which issues are code bugs (appear everywhere) vs environment-specific (appear on one system only)
+    3. Evaluate whether the installer reliably bootstraps from scratch
+    4. Check if the scan pipeline flows correctly end-to-end
+    5. Flag any new issues that appear on the third system
+    6. Suggest fixes prioritized by impact
+    
+    ## Known Issues Still Open (from previous testing)
+    1. Naabu install fails — needs libpcap-dev (apt broken) + possible runtime libpcap.so dependency
+    2. Nuclei GitHub Release downloads but binary doesn't reach PATH — findAndInstallBinary() or zip extraction bug
+    3. Findomain GitHub Release asset pattern "linux_amd64" doesn't match actual release filenames
+    4. trufflehog GitHub Release same extraction issue as Nuclei
+    5. crt.sh parser brittle — should use encoding/json instead of string splitting
+    6. Zone transfer false positive potential — validates >100 bytes instead of actual zone records
+    7. Zone transfers not gated behind PassiveOnly flag
+    8. No Shodan/Censys/VirusTotal API integration despite CLI flags existing
+    9. apt-get exit status 100 handling — installer should detect broken apt and skip gracefully
     
     ## What Has Been Fixed So Far
-    - httpx Python vs ProjectDiscovery conflict: RESOLVED (auto-detection + rename + reinstall)
-    - Port module silent no-op when Naabu missing: RESOLVED (Nmap top-1000 fallback added)
-    - Installer only had 3 install methods: RESOLVED (expanded to 9 methods with GitHub Release downloader)
-    - Installer didn't log failure reasons: RESOLVED (warns on each failed attempt with method name)
-    - Installer didn't run apt-get update: RESOLVED
-    - No build dependency installation: RESOLVED (libpcap-dev, unzip, curl, git checked first)
-    - No SecLists installation: RESOLVED (auto-installs via apt or git clone)
-    - DNS module silently skipped when dnsx missing: RESOLVED (now logs skip message)
-    - gowitness installation: RESOLVED (GitHub Release fallback works)
+    - httpx Python vs ProjectDiscovery conflict: RESOLVED
+    - Port module silent no-op when Naabu missing: RESOLVED (Nmap fallback)
+    - Installer expanded from 3 to 9 install methods: RESOLVED
+    - Install failure logging: RESOLVED
+    - apt-get update at start: RESOLVED
+    - Build dependency installation: RESOLVED
+    - SecLists auto-installation: RESOLVED
+    - DNS module silent skip: RESOLVED
+    - gowitness installation via GitHub Release: RESOLVED
     
-    The full source code for all files is pushed to the repository. Please review the repo code against this context, compare the cross-system test results, reevaluate the current state of the tool, and help me continue development — focus on fixing the remaining known issues listed above.
+    The full source code is at https://github.com/H3llKa1ser/recon-storm — review the repo, wait for my System C test output, then do the full cross-system comparison and continue development.
