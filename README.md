@@ -74,8 +74,3 @@
 
     ./reconstorm -d example.com -o ./recon-example.com-20260311 -resume
 
-
-    - DNS module silent skip: RESOLVED
-    - gowitness installation via GitHub Release: RESOLVED
-    
-    The full source code is at https://github.com/H3llKa1ser/recon-storm — review the repo, wait for my System C test output, then do the full cross-system comparison and continue development.
