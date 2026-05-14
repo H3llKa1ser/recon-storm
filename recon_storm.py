@@ -1961,4 +1961,273 @@ class ReconStorm:
 
         self.results.end_time = datetime.datetime.now()
 
-        # ── Phase 10: Report
+                # ── Phase 10: Report Generation ──
+        self.logger.info("=" * 60)
+        report_gen = HTMLReportGenerator(self.results, self.output_dir, self.logger)
+        report_path = report_gen.generate()
+
+        # Also dump raw JSON for programmatic use
+        json_path = self._dump_json()
+
+        # Print summary
+        self._print_summary(report_path, json_path)
+
+        return report_path
+
+    def _dump_json(self) -> str:
+        """Dump all results to a JSON file for programmatic consumption."""
+        r = self.results
+        data = {
+            "target": r.target,
+            "start_time": r.start_time.isoformat() if r.start_time else None,
+            "end_time": r.end_time.isoformat() if r.end_time else None,
+            "duration_seconds": (r.end_time - r.start_time).total_seconds() if r.end_time and r.start_time else 0,
+            "summary": {
+                "total_subdomains": len(r.subdomains),
+                "alive_subdomains": sum(1 for s in r.subdomains if s.is_alive),
+                "unique_ips": len(set(ip for s in r.subdomains for ip in s.ip_addresses)),
+                "open_ports": len(r.open_ports),
+                "directories_found": len(r.directories),
+                "interesting_dirs": sum(1 for d in r.directories if d.interesting),
+                "js_files_analyzed": len(r.js_files),
+                "potential_secrets": sum(len(j.secrets) for j in r.js_files),
+                "js_endpoints": sum(len(j.endpoints) for j in r.js_files),
+                "parameters_found": sum(len(v) for v in r.parameters.values()),
+                "wayback_urls": len(r.wayback_urls),
+            },
+            "subdomains": [
+                {
+                    "subdomain": s.subdomain,
+                    "source": s.source,
+                    "ip_addresses": s.ip_addresses,
+                    "cname": s.cname,
+                    "is_alive": s.is_alive,
+                    "status_code": s.status_code,
+                    "title": s.title,
+                    "server": s.server,
+                    "content_length": s.content_length,
+                    "redirect_url": s.redirect_url,
+                    "technologies": s.technologies,
+                    "ssl_info": s.ssl_info,
+                }
+                for s in r.subdomains
+            ],
+            "dns_records": [
+                {
+                    "type": rec.record_type,
+                    "name": rec.name,
+                    "value": rec.value,
+                    "ttl": rec.ttl,
+                }
+                for rec in r.dns_records
+            ],
+            "open_ports": [
+                {
+                    "host": p.host,
+                    "port": p.port,
+                    "state": p.state,
+                    "service": p.service,
+                    "banner": p.banner,
+                }
+                for p in r.open_ports
+            ],
+            "directories": [
+                {
+                    "url": d.url,
+                    "status_code": d.status_code,
+                    "content_length": d.content_length,
+                    "content_type": d.content_type,
+                    "redirect": d.redirect,
+                    "interesting": d.interesting,
+                }
+                for d in r.directories
+            ],
+            "js_files": [
+                {
+                    "url": j.url,
+                    "size": j.size,
+                    "endpoints": j.endpoints,
+                    "secrets": j.secrets,
+                }
+                for j in r.js_files
+            ],
+            "parameters": {
+                endpoint: sorted(params)
+                for endpoint, params in r.parameters.items()
+            },
+            "wayback_urls": [
+                {
+                    "url": wu.url,
+                    "timestamp": wu.timestamp,
+                    "mime_type": wu.mime_type,
+                    "status_code": wu.status_code,
+                }
+                for wu in r.wayback_urls
+            ],
+            "whois": {
+                "domain": r.whois_info.domain,
+                "registrar": r.whois_info.registrar,
+                "org": r.whois_info.org,
+                "creation_date": r.whois_info.creation_date,
+                "expiration_date": r.whois_info.expiration_date,
+                "name_servers": r.whois_info.name_servers,
+                "emails": r.whois_info.emails,
+            } if r.whois_info else None,
+            "errors": r.errors,
+        }
+
+        os.makedirs(self.output_dir, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        json_filename = f"recon_storm_{r.target}_{timestamp}.json"
+        json_path = os.path.join(self.output_dir, json_filename)
+
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+
+        self.logger.info(f"  ★ JSON data saved to: {json_path}")
+        return json_path
+
+    def _print_summary(self, report_path: str, json_path: str):
+        """Print a final summary to the console."""
+        r = self.results
+        duration = (r.end_time - r.start_time).total_seconds() if r.end_time and r.start_time else 0
+        alive = sum(1 for s in r.subdomains if s.is_alive)
+        unique_ips = len(set(ip for s in r.subdomains for ip in s.ip_addresses))
+        interesting = sum(1 for d in r.directories if d.interesting)
+        secrets = sum(len(j.secrets) for j in r.js_files)
+        js_endpoints = sum(len(j.endpoints) for j in r.js_files)
+        total_params = sum(len(v) for v in r.parameters.values())
+
+        summary = f"""
+╔══════════════════════════════════════════════════════════════╗
+║                   RECON STORM — SUMMARY                     ║
+╠══════════════════════════════════════════════════════════════╣
+║  Target:             {r.target:<39} ║
+║  Duration:           {duration:<39.1f} ║
+╠══════════════════════════════════════════════════════════════╣
+║  Subdomains Found:   {len(r.subdomains):<39} ║
+║  Alive Hosts:        {alive:<39} ║
+║  Unique IPs:         {unique_ips:<39} ║
+║  DNS Records:        {len(r.dns_records):<39} ║
+║  Open Ports:         {len(r.open_ports):<39} ║
+║  Endpoints Found:    {len(r.directories):<39} ║
+║  Interesting Dirs:   {interesting:<39} ║
+║  JS Files Analyzed:  {len(r.js_files):<39} ║
+║  Potential Secrets:  {secrets:<39} ║
+║  JS Endpoints:       {js_endpoints:<39} ║
+║  Parameters:         {total_params:<39} ║
+║  Wayback URLs:       {len(r.wayback_urls):<39} ║
+╠══════════════════════════════════════════════════════════════╣
+║  HTML Report: {report_path:<46} ║
+║  JSON Data:   {json_path:<46} ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+        print(summary)
+
+        # Highlight critical findings
+        if secrets > 0:
+            self.logger.warning(f"🚨 {secrets} POTENTIAL SECRETS found in JavaScript files! Review immediately.")
+        if interesting > 0:
+            self.logger.warning(f"🔍 {interesting} INTERESTING directories/files found (admin panels, configs, debug endpoints).")
+
+        # Highlight potential takeover candidates (CNAME with no resolution)
+        takeover_candidates = []
+        for s in r.subdomains:
+            if s.cname and not s.is_alive:
+                takeover_candidates.append(s)
+        if takeover_candidates:
+            self.logger.warning(f"🎯 {len(takeover_candidates)} potential SUBDOMAIN TAKEOVER candidates detected:")
+            for tc in takeover_candidates[:10]:
+                self.logger.warning(f"   → {tc.subdomain} (CNAME: {tc.cname})")
+
+        # Highlight high-risk open ports
+        high_risk_ports = {21, 23, 445, 1433, 3306, 3389, 5432, 5900, 6379, 11211, 27017}
+        risky = [p for p in r.open_ports if p.port in high_risk_ports]
+        if risky:
+            self.logger.warning(f"⚠️  {len(risky)} HIGH-RISK ports found open:")
+            for rp in risky[:10]:
+                self.logger.warning(f"   → {rp.host}:{rp.port} ({rp.service})")
+
+
+# ─────────────────────────────────────────────────────────
+# CLI ENTRY POINT
+# ─────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="ReconStorm — Bug Bounty Enumeration & HTML Reporting Tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s -d example.com
+  %(prog)s -d example.com --threads 50 --timeout 15
+  %(prog)s -d example.com -o ./reports --verbose
+
+Methodology Phases:
+  1. Subdomain Enumeration (7 passive sources + DNS brute-force)
+  2. DNS Record Collection (A, AAAA, CNAME, MX, NS, TXT, SOA, SRV, CAA)
+  3. HTTP Probing & Technology Fingerprinting
+  4. Port Scanning (top 35 common ports)
+  5. Directory & Endpoint Discovery (80+ common paths)
+  6. JavaScript File Analysis (endpoint + secret extraction)
+  7. Parameter Discovery (from HTML forms, URLs, Wayback)
+  8. Wayback Machine URL Harvesting
+  9. WHOIS & ASN Lookup
+  10. HTML Report Generation with Interactive Charts
+        """,
+    )
+
+    parser.add_argument(
+        "-d", "--domain",
+        required=True,
+        help="Target domain to enumerate (e.g., example.com)"
+    )
+    parser.add_argument(
+        "-t", "--threads",
+        type=int,
+        default=30,
+        help="Number of concurrent threads (default: 30)"
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=10,
+        help="Request timeout in seconds (default: 10)"
+    )
+    parser.add_argument(
+        "-o", "--output",
+        default="./recon_output",
+        help="Output directory for reports (default: ./recon_output)"
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose/debug output"
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"ReconStorm v{VERSION}"
+    )
+
+    args = parser.parse_args()
+
+    # Validate domain
+    domain = args.domain.lower().strip()
+    domain = domain.replace("http://", "").replace("https://", "").rstrip("/")
+    if "/" in domain:
+        domain = domain.split("/")[0]
+
+    # Run the enumeration
+    recon = ReconStorm(
+        domain=domain,
+        threads=args.threads,
+        timeout=args.timeout,
+        output_dir=args.output,
+        verbose=args.verbose,
+    )
+    recon.run()
+
+
+if __name__ == "__main__":
+    main()
