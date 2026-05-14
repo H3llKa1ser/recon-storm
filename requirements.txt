@@ -1,0 +1,30 @@
+# ═══════════════════════════════════════════════════════════
+#  ReconStorm v1.0.0 — Dependencies
+#  Install: pip install -r requirements.txt
+# ═══════════════════════════════════════════════════════════
+
+# HTTP requests with session management, retries, and connection pooling
+requests>=2.31.0,<3.0.0
+
+# DNS resolution and record querying (A, AAAA, CNAME, MX, NS, TXT, SOA, SRV, CAA)
+dnspython>=2.4.0,<3.0.0
+
+# WHOIS domain lookups (registrar, org, dates, nameservers)
+python-whois>=0.9.4,<1.0.0
+
+# HTML parsing for title extraction, JS file discovery, and form parameter mining
+beautifulsoup4>=4.12.0,<5.0.0
+
+# Accurate domain/subdomain extraction and base domain parsing
+tldextract>=5.1.0,<6.0.0
+
+# ───────────────────────────────────────────────────────────
+#  Transitive / Recommended (installed automatically)
+# ───────────────────────────────────────────────────────────
+# urllib3        — used by requests (SSL warning suppression)
+# certifi       — used by requests (CA bundle)
+# charset-normalizer — used by requests (encoding detection)
+# idna           — used by requests & tldextract (international domains)
+# soupsieve      — used by beautifulsoup4 (CSS selectors)
+# filelock       — used by tldextract (cache locking)
+# requests-file  — used by tldextract (local file adapter)
