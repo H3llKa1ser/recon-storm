@@ -1,234 +1,207 @@
 package scanner
 
 import (
-	"bufio"
-	"context"
-	"encoding/json"
-	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"sort"
-	"strings"
-	"sync"
+    "context"
+    "encoding/json"
+    "fmt"
+    "io"
+    "net/http"
+    "os"
+    "os/exec"
+    "path/filepath"
+    "sort"
+    "strings"
+    "sync"
+    "time"
 
-	"github.com/H3llKa1ser/recon-storm/pkg/config"
-	"github.com/H3llKa1ser/recon-storm/pkg/logger"
-	"github.com/H3llKa1ser/recon-storm/pkg/state"
+    "github.com/H3llKa1ser/recon-storm/pkg/config"
+    "github.com/H3llKa1ser/recon-storm/pkg/logger"
+    "github.com/H3llKa1ser/recon-storm/pkg/state"
 )
 
 type SubdomainModule struct {
-	cfg   *config.Config
-	state *state.Manager
-	log   *logger.Logger
+    cfg   *config.Config
+    state *state.Manager
+    log   *logger.Logger
 }
 
 func NewSubdomainModule(cfg *config.Config, sm *state.Manager, log *logger.Logger) *SubdomainModule {
-	return &SubdomainModule{cfg: cfg, state: sm, log: log}
+    return &SubdomainModule{cfg: cfg, state: sm, log: log}
 }
 
 func (m *SubdomainModule) Name() string { return "subdomains" }
 
 func (m *SubdomainModule) Run(ctx context.Context, domain string) error {
-	outDir := filepath.Join(m.cfg.OutputDir, domain, "subdomains")
-	os.MkdirAll(outDir, 0755)
+    outDir := filepath.Join(m.cfg.OutputDir, domain, "subdomains")
+    os.MkdirAll(outDir, 0755)
 
-	var mu sync.Mutex
-	allSubs := make(map[string]string) // subdomain -> source
+    var mu sync.Mutex
+    allSubs := make(map[string]string)
 
-	type subTool struct {
-		name    string
-		binary  string
-		args    []string
-		outFile string
-	}
+    type subTool struct {
+        name, binary string
+        args         []string
+        outFile      string
+        captureStdout bool
+    }
 
-	tools := []subTool{
-		{
-			name:    "subfinder",
-			binary:  "subfinder",
-			args:    []string{"-d", domain, "-all", "-silent", "-o", filepath.Join(outDir, "subfinder.txt")},
-			outFile: filepath.Join(outDir, "subfinder.txt"),
-		},
-		{
-			name:    "amass",
-			binary:  "amass",
-			args:    []string{"enum", "-passive", "-d", domain, "-o", filepath.Join(outDir, "amass.txt")},
-			outFile: filepath.Join(outDir, "amass.txt"),
-		},
-		{
-			name:    "assetfinder",
-			binary:  "assetfinder",
-			args:    []string{"--subs-only", domain},
-			outFile: filepath.Join(outDir, "assetfinder.txt"),
-		},
-		{
-			name:    "findomain",
-			binary:  "findomain",
-			args:    []string{"-t", domain, "-u", filepath.Join(outDir, "findomain.txt")},
-			outFile: filepath.Join(outDir, "findomain.txt"),
-		},
-	}
+    tools := []subTool{
+        {name: "subfinder", binary: "subfinder",
+            args: []string{"-d", domain, "-all", "-silent", "-o", filepath.Join(outDir, "subfinder.txt")},
+            outFile: filepath.Join(outDir, "subfinder.txt")},
+        {name: "amass", binary: "amass",
+            args: []string{"enum", "-passive", "-d", domain, "-o", filepath.Join(outDir, "amass.txt")},
+            outFile: filepath.Join(outDir, "amass.txt")},
+        {name: "assetfinder", binary: "assetfinder",
+            args: []string{"--subs-only", domain},
+            outFile: filepath.Join(outDir, "assetfinder.txt"), captureStdout: true},
+        {name: "findomain", binary: "findomain",
+            args: []string{"-t", domain, "-u", filepath.Join(outDir, "findomain.txt")},
+            outFile: filepath.Join(outDir, "findomain.txt")},
+    }
 
-	// Run all tools concurrently
-	var wg sync.WaitGroup
-	for _, tool := range tools {
-		t := tool
-		if _, err := exec.LookPath(t.binary); err != nil {
-			m.log.Warn("  %s not found, skipping — install it for better coverage", t.name)
-			continue
-		}
+    var wg sync.WaitGroup
+    for _, t := range tools {
+        t := t
+        if !toolExists(t.binary) {
+            m.log.Warn("  %s not found, skipping — install it for better coverage", t.name)
+            continue
+        }
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            m.log.Info("  Running %s...", t.name)
 
-			m.log.Info("  Running %s...", t.name)
+            cmd := exec.CommandContext(ctx, t.binary, t.args...)
+            if t.captureStdout {
+                out, err := cmd.Output()
+                if err != nil {
+                    m.log.Debug("  %s error: %v", t.name, err)
+                    return
+                }
+                os.WriteFile(t.outFile, out, 0644)
+            } else {
+                cmd.Run()
+            }
 
-			cmd := exec.CommandContext(ctx, t.binary, t.args...)
+            subs := readLines(t.outFile)
+            mu.Lock()
+            for _, sub := range subs {
+                sub = strings.TrimSpace(strings.ToLower(sub))
+                if sub != "" && strings.HasSuffix(sub, domain) {
+                    allSubs[sub] = t.name
+                }
+            }
+            mu.Unlock()
+            m.log.Info("  %s found %d subdomains", t.name, len(subs))
+        }()
+    }
+    wg.Wait()
 
-			if t.name == "assetfinder" {
-				output, err := cmd.Output()
-				if err != nil {
-					m.log.Warn("  %s error: %v", t.name, err)
-					return
-				}
-				os.WriteFile(t.outFile, output, 0644)
-			} else {
-				if output, err := cmd.CombinedOutput(); err != nil {
-					m.log.Debug("  %s stderr: %s", t.name, string(output))
-				}
-			}
+    // crt.sh with proper JSON parsing
+    m.log.Info("  Querying crt.sh...")
+    crtSubs := m.queryCrtSh(ctx, domain)
+    for _, sub := range crtSubs {
+        allSubs[sub] = "crt.sh"
+    }
 
-			subs := readLines(t.outFile)
-			mu.Lock()
-			for _, sub := range subs {
-				sub = strings.TrimSpace(strings.ToLower(sub))
-				if sub != "" && strings.HasSuffix(sub, domain) {
-					allSubs[sub] = t.name
-				}
-			}
-			mu.Unlock()
-			m.log.Info("  %s found %d subdomains", t.name, len(subs))
-		}()
-	}
-	wg.Wait()
+    // Deduplicate and sort
+    uniqueSubs := make([]string, 0, len(allSubs))
+    for sub := range allSubs {
+        uniqueSubs = append(uniqueSubs, sub)
+    }
+    sort.Strings(uniqueSubs)
 
-	// ── CRT.SH (passive, no tool needed) ──
-	m.log.Info("  Querying crt.sh...")
-	crtSubs := m.queryCrtSh(ctx, domain)
-	for _, sub := range crtSubs {
-		allSubs[sub] = "crt.sh"
-	}
+    // Write output
+    finalFile := filepath.Join(outDir, "all_subdomains.txt")
+    f, err := os.Create(finalFile)
+    if err != nil {
+        return fmt.Errorf("create output: %w", err)
+    }
+    defer f.Close()
 
-	// ── Aggregate & deduplicate ──
-	uniqueSubs := make([]string, 0, len(allSubs))
-	for sub := range allSubs {
-		uniqueSubs = append(uniqueSubs, sub)
-	}
-	sort.Strings(uniqueSubs)
+    for _, sub := range uniqueSubs {
+        fmt.Fprintln(f, sub)
+        m.state.AddFinding(state.Finding{
+            Type: "subdomain", Value: sub, Source: allSubs[sub],
+            Domain: domain, Severity: "info",
+            Metadata: map[string]string{"source": allSubs[sub]},
+        })
+    }
 
-	finalFile := filepath.Join(outDir, "all_subdomains.txt")
-	f, err := os.Create(finalFile)
-	if err != nil {
-		return fmt.Errorf("failed to create output file: %w", err)
-	}
-	defer f.Close()
+    m.state.UpdateStats(func(s *state.ScanStats) {
+        s.TotalSubdomains += len(uniqueSubs)
+    })
 
-	for _, sub := range uniqueSubs {
-		fmt.Fprintln(f, sub)
-
-		m.state.AddFinding(state.Finding{
-			Type:     "subdomain",
-			Value:    sub,
-			Source:   allSubs[sub],
-			Domain:   domain,
-			Severity: "info",
-			Metadata: map[string]string{
-				"source": allSubs[sub],
-			},
-		})
-	}
-
-	m.state.UpdateStats(func(s *state.ScanStats) {
-		s.TotalSubdomains += len(uniqueSubs)
-	})
-
-	m.log.Success("  Total unique subdomains: %d → %s", len(uniqueSubs), finalFile)
-	return nil
+    m.log.Success("  Total unique subdomains: %d → %s", len(uniqueSubs), finalFile)
+    return nil
 }
 
-// queryCrtSh queries the crt.sh Certificate Transparency log using proper JSON parsing
+// queryCrtSh uses proper JSON parsing instead of string splitting
 func (m *SubdomainModule) queryCrtSh(ctx context.Context, domain string) []string {
-	cmd := exec.CommandContext(ctx, "curl", "-s", "--max-time", "30",
-		fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", domain))
+    url := fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", domain)
 
-	output, err := cmd.Output()
-	if err != nil {
-		m.log.Debug("  crt.sh query failed: %v", err)
-		return nil
-	}
+    client := &http.Client{Timeout: 30 * time.Second}
+    req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+    if err != nil {
+        m.log.Debug("  crt.sh request error: %v", err)
+        return nil
+    }
+    req.Header.Set("User-Agent", "ReconStorm/2.0")
 
-	// Handle empty response
-	if len(output) == 0 {
-		m.log.Debug("  crt.sh returned empty response")
-		return nil
-	}
+    resp, err := client.Do(req)
+    if err != nil {
+        m.log.Debug("  crt.sh error: %v", err)
+        return nil
+    }
+    defer resp.Body.Close()
 
-	// Parse JSON properly instead of string splitting
-	var entries []struct {
-		NameValue string `json:"name_value"`
-	}
-	if err := json.Unmarshal(output, &entries); err != nil {
-		m.log.Debug("  crt.sh JSON parse failed: %v", err)
-		return nil
-	}
+    if resp.StatusCode != 200 {
+        m.log.Debug("  crt.sh returned %d", resp.StatusCode)
+        return nil
+    }
 
-	var subs []string
-	seen := make(map[string]bool)
-	for _, entry := range entries {
-		// name_value can contain multiple names separated by newlines
-		for _, name := range strings.Split(entry.NameValue, "\n") {
-			name = strings.TrimSpace(strings.ToLower(name))
-			name = strings.TrimPrefix(name, "*.")
-			if name != "" && !seen[name] {
-				seen[name] = true
-				subs = append(subs, name)
-			}
-		}
-	}
+    body, err := io.ReadAll(resp.Body)
+    if err != nil {
+        m.log.Debug("  crt.sh read error: %v", err)
+        return nil
+    }
 
-	m.log.Info("  crt.sh found %d subdomains", len(subs))
-	return subs
-}
+    // Proper JSON parsing
+    var entries []struct {
+        NameValue string `json:"name_value"`
+        CommonName string `json:"common_name"`
+    }
 
-// readLines reads a file and returns non-empty lines
-func readLines(path string) []string {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil
-	}
-	defer file.Close()
+    if err := json.Unmarshal(body, &entries); err != nil {
+        m.log.Debug("  crt.sh JSON parse error: %v", err)
+        return nil
+    }
 
-	var lines []string
-	sc := bufio.NewScanner(file)
-	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line != "" {
-			lines = append(lines, line)
-		}
-	}
-	return lines
-}
+    seen := make(map[string]bool)
+    var subs []string
 
-// readLinesOrWarn reads a file and returns its lines, logging a warning if empty.
-// Returns nil, false if the file is missing or empty.
-func readLinesOrWarn(path string, log *logger.Logger, moduleName string) ([]string, bool) {
-	lines := readLines(path)
-	if len(lines) == 0 {
-		log.Warn("  %s: input file %s is empty or missing, skipping", moduleName, filepath.Base(path))
-		return nil, false
-	}
-	return lines, true
+    for _, entry := range entries {
+        // name_value can contain multiple names separated by newlines
+        names := strings.Split(entry.NameValue, "\n")
+        for _, name := range names {
+            name = strings.TrimSpace(strings.ToLower(name))
+            name = strings.TrimPrefix(name, "*.")
+            if name != "" && !seen[name] && strings.HasSuffix(name, domain) {
+                seen[name] = true
+                subs = append(subs, name)
+            }
+        }
+        // Also check common_name
+        cn := strings.TrimSpace(strings.ToLower(entry.CommonName))
+        cn = strings.TrimPrefix(cn, "*.")
+        if cn != "" && !seen[cn] && strings.HasSuffix(cn, domain) {
+            seen[cn] = true
+            subs = append(subs, cn)
+        }
+    }
+
+    m.log.Info("  crt.sh found %d subdomains", len(subs))
+    return subs
 }
