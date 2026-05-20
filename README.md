@@ -74,3 +74,29 @@
 
     ./reconstorm -d example.com -o ./recon-example.com-20260311 -resume
 
+    # Install Python dependencies
+    pip install shodan censys python-dotenv requests colorama pyyaml schedule
+    
+    # Check which tools are installed
+    python3 recon_storm.py --check-tools
+    
+    # Print full installation guide
+    python3 recon_storm.py --install-guide
+    
+    # Generate config file template
+    python3 recon_storm.py --generate-config
+    
+    # Full scan against a target
+    python3 recon_storm.py --target example.com
+    
+    # Run only stages 1, 2, 3
+    python3 recon_storm.py --target example.com --stages 1,2,3
+    
+    # Full scan + continuous monitoring every 4 hours
+    python3 recon_storm.py --target example.com --monitor --interval 4
+    
+    # Scan with custom config
+    python3 recon_storm.py --target example.com --config recon_storm_config.yaml -v
+    
+    # Scan multiple targets from a file
+    python3 recon_storm.py --target-list targets.txt
