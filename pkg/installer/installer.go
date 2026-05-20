@@ -15,39 +15,29 @@ import (
     "github.com/H3llKa1ser/recon-storm/pkg/logger"
 )
 
-// ── Install Method Types ────────────────────────────────
-
 type InstallMethod int
 
 const (
-    MethodGoInstall      InstallMethod = iota // go install ...@latest
-    MethodApt                                 // sudo apt-get install -y ...
-    MethodGitHubRelease                       // Download binary from GitHub Releases
-    MethodGitCloneMake                        // git clone + make + sudo make install
-    MethodCargoInstall                        // cargo install ...
-    MethodPipInstall                          // pip3 install ...
-    MethodBrew                                // brew install ...
-    MethodSnap                                // sudo snap install ...
-    MethodCustomScript                        // Custom bash commands
+    MethodGoInstall InstallMethod = iota
+    MethodApt
+    MethodGitHubRelease
+    MethodGitCloneMake
+    MethodCargoInstall
+    MethodPipInstall
+    MethodBrew
+    MethodCustomScript
 )
 
-// InstallStep represents one installation attempt
 type InstallStep struct {
-    Method  InstallMethod
-    Command string // for MethodGoInstall, MethodApt, MethodBrew, MethodPipInstall, MethodCargoInstall, MethodSnap
-
-    // For MethodGitHubRelease
-    GHRepo     string // e.g., "projectdiscovery/nuclei"
-    GHAsset    string // substring to match in asset name, e.g., "linux_amd64"
-    GHAssetExt string // "zip", "tar.gz", or "" for raw binary
-    GHBinary   string // binary name inside the archive (if different from tool binary)
-
-    // For MethodGitCloneMake
-    GitURL     string   // e.g., "https://github.com/blechschmidt/massdns.git"
-    BuildCmds  []string // commands to run after clone, e.g., ["make", "sudo make install"]
-
-    // For MethodCustomScript
-    Script []string // list of bash commands to execute in order
+    Method     InstallMethod
+    Command    string
+    GHRepo     string
+    GHAsset    string
+    GHAssetExt string
+    GHBinary   string
+    GitURL     string
+    BuildCmds  []string
+    Script     []string
 }
 
 type Tool struct {
@@ -59,1017 +49,569 @@ type Tool struct {
 }
 
 type Installer struct {
-    log       *logger.Logger
-    tools     []Tool
-    arch      string
-    osName    string
-    aptReady  bool
+    log   *logger.Logger
+    tools []Tool
+    arch  string
+    os    string
 }
 
 func New(log *logger.Logger) *Installer {
-    // Detect system architecture
-    arch := runtime.GOARCH
-    osName := runtime.GOOS
-
-    // Map Go arch names to common release naming conventions
-    archMap := map[string]string{
-        "amd64": "amd64",
-        "arm64": "arm64",
-        "arm":   "armv6",
-        "386":   "386",
+    i := &Installer{
+        log:  log,
+        arch: runtime.GOARCH,
+        os:   runtime.GOOS,
     }
-    if mapped, ok := archMap[arch]; ok {
-        arch = mapped
-    }
+    i.tools = i.defineTools()
+    return i
+}
 
-    inst := &Installer{
-        log:    log,
-        arch:   arch,
-        osName: osName,
-    }
+func (i *Installer) goCmd(pkg string) InstallStep {
+    return InstallStep{Method: MethodGoInstall, Command: fmt.Sprintf("go install -v %s@latest", pkg)}
+}
 
-    inst.tools = inst.defineTools()
-    return inst
+func (i *Installer) apt(pkg string) InstallStep {
+    return InstallStep{Method: MethodApt, Command: fmt.Sprintf("sudo apt-get install -y %s", pkg)}
+}
+
+func (i *Installer) brew(pkg string) InstallStep {
+    return InstallStep{Method: MethodBrew, Command: fmt.Sprintf("brew install %s", pkg)}
+}
+
+func (i *Installer) gh(repo, asset, ext, bin string) InstallStep {
+    return InstallStep{Method: MethodGitHubRelease, GHRepo: repo, GHAsset: asset, GHAssetExt: ext, GHBinary: bin}
+}
+
+func (i *Installer) gitClone(url string, cmds []string) InstallStep {
+    return InstallStep{Method: MethodGitCloneMake, GitURL: url, BuildCmds: cmds}
+}
+
+func (i *Installer) script(cmds []string) InstallStep {
+    return InstallStep{Method: MethodCustomScript, Script: cmds}
 }
 
 func (i *Installer) defineTools() []Tool {
-    goInstallCmd := func(pkg string) InstallStep {
-        return InstallStep{
-            Method:  MethodGoInstall,
-            Command: fmt.Sprintf("go install -v %s@latest", pkg),
-        }
-    }
-
-    aptInstall := func(pkg string) InstallStep {
-        return InstallStep{
-            Method:  MethodApt,
-            Command: fmt.Sprintf("sudo apt-get install -y %s", pkg),
-        }
-    }
-
-    brewInstall := func(pkg string) InstallStep {
-        return InstallStep{
-            Method:  MethodBrew,
-            Command: fmt.Sprintf("brew install %s", pkg),
-        }
-    }
-
-    ghRelease := func(repo, assetPattern, ext, binaryName string) InstallStep {
-        return InstallStep{
-            Method:     MethodGitHubRelease,
-            GHRepo:     repo,
-            GHAsset:    assetPattern,
-            GHAssetExt: ext,
-            GHBinary:   binaryName,
-        }
-    }
-
-    gitClone := func(url string, cmds []string) InstallStep {
-        return InstallStep{
-            Method:    MethodGitCloneMake,
-            GitURL:    url,
-            BuildCmds: cmds,
-        }
-    }
-
-    pipInstall := func(pkg string) InstallStep {
-        return InstallStep{
-            Method:  MethodPipInstall,
-            Command: fmt.Sprintf("pip3 install %s", pkg),
-        }
-    }
-
-    cargoInstall := func(pkg string) InstallStep {
-        return InstallStep{
-            Method:  MethodCargoInstall,
-            Command: fmt.Sprintf("cargo install %s", pkg),
-        }
-    }
+    a := i.arch // amd64, arm64, etc.
+    linuxArch := fmt.Sprintf("linux_%s", a)
 
     return []Tool{
-        // ── Subdomain Enumeration ────────────────────────
-        {
-            Name:     "Subfinder",
-            Binary:   "subfinder",
-            Category: "subdomain",
-            Required: true,
-            InstallSteps: []InstallStep{
-                goInstallCmd("github.com/projectdiscovery/subfinder/v2/cmd/subfinder"),
-                ghRelease("projectdiscovery/subfinder", fmt.Sprintf("linux_%s", i.arch), "zip", "subfinder"),
-            },
-        },
-        {
-            Name:     "Amass",
-            Binary:   "amass",
-            Category: "subdomain",
-            Required: false,
-            InstallSteps: []InstallStep{
-                goInstallCmd("github.com/owasp-amass/amass/v4/..."),
-                ghRelease("owasp-amass/amass", fmt.Sprintf("linux_%s", i.arch), "zip", "amass"),
-                aptInstall("amass"),
-                brewInstall("amass"),
-            },
-        },
-        {
-            Name:     "Assetfinder",
-            Binary:   "assetfinder",
-            Category: "subdomain",
-            Required: false,
-            InstallSteps: []InstallStep{
-                goInstallCmd("github.com/tomnomnom/assetfinder"),
-            },
-        },
-        {
-            Name:     "Findomain",
-            Binary:   "findomain",
-            Category: "subdomain",
-            Required: false,
-            InstallSteps: []InstallStep{
-                ghRelease("Findomain/Findomain", fmt.Sprintf("linux_%s", i.arch), "", "findomain"),
-                cargoInstall("findomain"),
-                InstallStep{
-                    Method: MethodCustomScript,
-                    Script: []string{
-                        fmt.Sprintf("curl -sL https://github.com/Findomain/Findomain/releases/latest/download/findomain-linux-%s.zip -o /tmp/findomain.zip", i.arch),
-                        "unzip -o /tmp/findomain.zip -d /tmp/findomain_extract",
-                        "chmod +x /tmp/findomain_extract/findomain",
-                        "sudo mv /tmp/findomain_extract/findomain /usr/local/bin/",
-                        "rm -rf /tmp/findomain.zip /tmp/findomain_extract",
-                    },
-                },
-                brewInstall("findomain"),
-            },
-        },
-        {
-            Name:     "Shuffledns",
-            Binary:   "shuffledns",
-            Category: "subdomain",
-            Required: false,
-            InstallSteps: []InstallStep{
-                goInstallCmd("github.com/projectdiscovery/shuffledns/cmd/shuffledns"),
-                ghRelease("projectdiscovery/shuffledns", fmt.Sprintf("linux_%s", i.arch), "zip", "shuffledns"),
-            },
-        },
+        // ── Build Dependencies ──
+        {Name: "curl", Binary: "curl", Category: "build-dep", Required: true, InstallSteps: []InstallStep{i.apt("curl")}},
+        {Name: "git", Binary: "git", Category: "build-dep", Required: true, InstallSteps: []InstallStep{i.apt("git")}},
+        {Name: "unzip", Binary: "unzip", Category: "build-dep", Required: false, InstallSteps: []InstallStep{i.apt("unzip")}},
+        {Name: "jq", Binary: "jq", Category: "build-dep", Required: false, InstallSteps: []InstallStep{i.apt("jq")}},
+        {Name: "dig", Binary: "dig", Category: "build-dep", Required: false, InstallSteps: []InstallStep{i.apt("dnsutils")}},
+        {Name: "libpcap-dev", Binary: "", Category: "build-dep", Required: false, InstallSteps: []InstallStep{i.apt("libpcap-dev")}},
+        {Name: "chromium", Binary: "chromium", Category: "build-dep", Required: false, InstallSteps: []InstallStep{
+            i.apt("chromium"),
+            i.apt("chromium-browser"),
+        }},
 
-        // ── DNS ──────────────────────────────────────────
-        {
-            Name:     "dnsx",
-            Binary:   "dnsx",
-            Category: "dns",
-            Required: true,
-            InstallSteps: []InstallStep{
-                goInstallCmd("github.com/projectdiscovery/dnsx/cmd/dnsx"),
-                ghRelease("projectdiscovery/dnsx", fmt.Sprintf("linux_%s", i.arch), "zip", "dnsx"),
-            },
-        },
-        {
-            Name:     "MassDNS",
-            Binary:   "massdns",
-            Category: "dns",
-            Required: false,
-            InstallSteps: []InstallStep{
-                aptInstall("massdns"),
-                gitClone("https://github.com/blechschmidt/massdns.git", []string{
-                    "make",
-                    "sudo make install",
-                }),
-                brewInstall("massdns"),
-            },
-        },
+        // ── Subdomain Enumeration ──
+        {Name: "Subfinder", Binary: "subfinder", Category: "subdomain", Required: true, InstallSteps: []InstallStep{
+            i.goCmd("github.com/projectdiscovery/subfinder/v2/cmd/subfinder"),
+            i.gh("projectdiscovery/subfinder", linuxArch, "zip", "subfinder"),
+        }},
+        {Name: "Amass", Binary: "amass", Category: "subdomain", Required: false, InstallSteps: []InstallStep{
+            i.goCmd("github.com/owasp-amass/amass/v4/..."),
+            i.gh("owasp-amass/amass", linuxArch, "zip", "amass"),
+            i.apt("amass"),
+        }},
+        {Name: "Assetfinder", Binary: "assetfinder", Category: "subdomain", Required: false, InstallSteps: []InstallStep{
+            i.goCmd("github.com/tomnomnom/assetfinder"),
+        }},
+        {Name: "Findomain", Binary: "findomain", Category: "subdomain", Required: false, InstallSteps: []InstallStep{
+            i.gh("Findomain/Findomain", "linux", "", "findomain"),
+            i.script([]string{
+                "curl -sL https://github.com/Findomain/Findomain/releases/latest/download/findomain-linux.zip -o /tmp/findomain.zip",
+                "unzip -o /tmp/findomain.zip -d /tmp/findomain_ex",
+                "chmod +x /tmp/findomain_ex/findomain",
+                "sudo mv /tmp/findomain_ex/findomain /usr/local/bin/",
+                "rm -rf /tmp/findomain.zip /tmp/findomain_ex",
+            }),
+        }},
 
-        // ── Port Scanning ────────────────────────────────
-        {
-            Name:     "Naabu",
-            Binary:   "naabu",
-            Category: "ports",
-            Required: true,
-            InstallSteps: []InstallStep{
-                goInstallCmd("github.com/projectdiscovery/naabu/v2/cmd/naabu"),
-                ghRelease("projectdiscovery/naabu", fmt.Sprintf("linux_%s", i.arch), "zip", "naabu"),
-                InstallStep{
-                    Method: MethodCustomScript,
-                    Script: []string{
-                        "sudo apt-get install -y libpcap-dev",
-                    },
-                },
-            },
-        },
-        {
-            Name:     "Nmap",
-            Binary:   "nmap",
-            Category: "ports",
-            Required: false,
-            InstallSteps: []InstallStep{
-                aptInstall("nmap"),
-                brewInstall("nmap"),
-            },
-        },
+        // ── DNS ──
+        {Name: "dnsx", Binary: "dnsx", Category: "dns", Required: true, InstallSteps: []InstallStep{
+            i.goCmd("github.com/projectdiscovery/dnsx/cmd/dnsx"),
+            i.gh("projectdiscovery/dnsx", linuxArch, "zip", "dnsx"),
+        }},
+        {Name: "MassDNS", Binary: "massdns", Category: "dns", Required: false, InstallSteps: []InstallStep{
+            i.apt("massdns"),
+            i.gitClone("https://github.com/blechschmidt/massdns.git", []string{"make", "sudo cp bin/massdns /usr/local/bin/"}),
+        }},
 
-        // ── Web Probing ──────────────────────────────────
-        {
-            Name:     "httpx-pd",
-            Binary:   "httpx",
-            Category: "web",
-            Required: true,
-            InstallSteps: []InstallStep{
-                // ProjectDiscovery httpx — must verify it's not the Python one
-                goInstallCmd("github.com/projectdiscovery/httpx/cmd/httpx"),
-                ghRelease("projectdiscovery/httpx", fmt.Sprintf("linux_%s", i.arch), "zip", "httpx"),
-            },
-        },
-        {
-            Name:     "httprobe",
-            Binary:   "httprobe",
-            Category: "web",
-            Required: false,
-            InstallSteps: []InstallStep{
-                goInstallCmd("github.com/tomnomnom/httprobe"),
-            },
-        },
+        // ── Port Scanning ──
+        {Name: "Naabu", Binary: "naabu", Category: "ports", Required: false, InstallSteps: []InstallStep{
+            i.gh("projectdiscovery/naabu", linuxArch, "zip", "naabu"),
+            i.goCmd("github.com/projectdiscovery/naabu/v2/cmd/naabu"),
+        }},
+        {Name: "Nmap", Binary: "nmap", Category: "ports", Required: true, InstallSteps: []InstallStep{
+            i.apt("nmap"),
+        }},
 
-        // ── Endpoint Discovery ───────────────────────────
-        {
-            Name:     "katana",
-            Binary:   "katana",
-            Category: "endpoints",
-            Required: false,
-            InstallSteps: []InstallStep{
-                goInstallCmd("github.com/projectdiscovery/katana/cmd/katana"),
-                ghRelease("projectdiscovery/katana", fmt.Sprintf("linux_%s", i.arch), "zip", "katana"),
-            },
-        },
-        {
-            Name:     "waybackurls",
-            Binary:   "waybackurls",
-            Category: "endpoints",
-            Required: false,
-            InstallSteps: []InstallStep{
-                goInstallCmd("github.com/tomnomnom/waybackurls"),
-            },
-        },
-        {
-            Name:     "gau",
-            Binary:   "gau",
-            Category: "endpoints",
-            Required: false,
-            InstallSteps: []InstallStep{
-                goInstallCmd("github.com/lc/gau/v2/cmd/gau"),
-                ghRelease("lc/gau", fmt.Sprintf("linux_%s", i.arch), "tar.gz", "gau"),
-            },
-        },
-        {
-            Name:     "GoSpider",
-            Binary:   "gospider",
-            Category: "endpoints",
-            Required: false,
-            InstallSteps: []InstallStep{
-                goInstallCmd("github.com/jaeles-project/gospider"),
-            },
-        },
-        {
-            Name:     "hakrawler",
-            Binary:   "hakrawler",
-            Category: "endpoints",
-            Required: false,
-            InstallSteps: []InstallStep{
-                goInstallCmd("github.com/hakluke/hakrawler"),
-            },
-        },
+        // ── Web Probing ──
+        {Name: "httpx-pd", Binary: "httpx", Category: "web", Required: true, InstallSteps: []InstallStep{
+            i.goCmd("github.com/projectdiscovery/httpx/cmd/httpx"),
+            i.gh("projectdiscovery/httpx", linuxArch, "zip", "httpx"),
+        }},
+        {Name: "httprobe", Binary: "httprobe", Category: "web", Required: false, InstallSteps: []InstallStep{
+            i.goCmd("github.com/tomnomnom/httprobe"),
+        }},
 
-        // ── Vulnerability Scanning ───────────────────────
-        {
-            Name:     "Nuclei",
-            Binary:   "nuclei",
-            Category: "vulns",
-            Required: true,
-            InstallSteps: []InstallStep{
-                ghRelease("projectdiscovery/nuclei", fmt.Sprintf("linux_%s", i.arch), "zip", "nuclei"),
-                goInstallCmd("github.com/projectdiscovery/nuclei/v3/cmd/nuclei"),
-            },
-        },
+        // ── Endpoint Discovery ──
+        {Name: "katana", Binary: "katana", Category: "endpoints", Required: false, InstallSteps: []InstallStep{
+            i.goCmd("github.com/projectdiscovery/katana/cmd/katana"),
+            i.gh("projectdiscovery/katana", linuxArch, "zip", "katana"),
+        }},
+        {Name: "waybackurls", Binary: "waybackurls", Category: "endpoints", Required: false, InstallSteps: []InstallStep{
+            i.goCmd("github.com/tomnomnom/waybackurls"),
+        }},
+        {Name: "gau", Binary: "gau", Category: "endpoints", Required: false, InstallSteps: []InstallStep{
+            i.goCmd("github.com/lc/gau/v2/cmd/gau"),
+            i.gh("lc/gau", linuxArch, "tar.gz", "gau"),
+        }},
+        {Name: "GoSpider", Binary: "gospider", Category: "endpoints", Required: false, InstallSteps: []InstallStep{
+            i.goCmd("github.com/jaeles-project/gospider"),
+        }},
+        {Name: "hakrawler", Binary: "hakrawler", Category: "endpoints", Required: false, InstallSteps: []InstallStep{
+            i.goCmd("github.com/hakluke/hakrawler"),
+        }},
 
-        // ── Secrets / Fuzzing ────────────────────────────
-        {
-            Name:     "ffuf",
-            Binary:   "ffuf",
-            Category: "secrets",
-            Required: false,
-            InstallSteps: []InstallStep{
-                goInstallCmd("github.com/ffuf/ffuf/v2"),
-                ghRelease("ffuf/ffuf", fmt.Sprintf("linux_%s", i.arch), "tar.gz", "ffuf"),
-                aptInstall("ffuf"),
-            },
-        },
-        {
-            Name:     "trufflehog",
-            Binary:   "trufflehog",
-            Category: "secrets",
-            Required: false,
-            InstallSteps: []InstallStep{
-                ghRelease("trufflesecurity/trufflehog", fmt.Sprintf("linux_%s", i.arch), "tar.gz", "trufflehog"),
-                pipInstall("trufflehog"),
-                brewInstall("trufflehog"),
-            },
-        },
+        // ── Vulnerability Scanning ──
+        {Name: "Nuclei", Binary: "nuclei", Category: "vulns", Required: true, InstallSteps: []InstallStep{
+            i.gh("projectdiscovery/nuclei", linuxArch, "zip", "nuclei"),
+            i.goCmd("github.com/projectdiscovery/nuclei/v3/cmd/nuclei"),
+        }},
 
-        // ── Screenshots ──────────────────────────────────
-        {
-            Name:     "gowitness",
-            Binary:   "gowitness",
-            Category: "screenshots",
-            Required: false,
-            InstallSteps: []InstallStep{
-                ghRelease("sensepost/gowitness", fmt.Sprintf("linux-%s", i.arch), "", "gowitness"),
-                goInstallCmd("github.com/sensepost/gowitness"),
-                InstallStep{
-                    Method: MethodCustomScript,
-                    Script: []string{
-                        fmt.Sprintf("curl -sL $(curl -s https://api.github.com/repos/sensepost/gowitness/releases/latest | grep browser_download_url | grep linux-%s | head -1 | cut -d '\"' -f4) -o /tmp/gowitness", i.arch),
-                        "chmod +x /tmp/gowitness",
-                        "sudo mv /tmp/gowitness /usr/local/bin/",
-                    },
-                },
-            },
-        },
+        // ── Fuzzing / Secrets ──
+        {Name: "ffuf", Binary: "ffuf", Category: "secrets", Required: false, InstallSteps: []InstallStep{
+            i.goCmd("github.com/ffuf/ffuf/v2"),
+            i.gh("ffuf/ffuf", linuxArch, "tar.gz", "ffuf"),
+            i.apt("ffuf"),
+        }},
 
-        // ── Utility ──────────────────────────────────────
-        {
-            Name:     "anew",
-            Binary:   "anew",
-            Category: "utility",
-            Required: false,
-            InstallSteps: []InstallStep{
-                goInstallCmd("github.com/tomnomnom/anew"),
-            },
-        },
-        {
-            Name:     "jq",
-            Binary:   "jq",
-            Category: "utility",
-            Required: false,
-            InstallSteps: []InstallStep{
-                aptInstall("jq"),
-                brewInstall("jq"),
-            },
-        },
+        // ── Screenshots ──
+        {Name: "gowitness", Binary: "gowitness", Category: "screenshots", Required: false, InstallSteps: []InstallStep{
+            i.gh("sensepost/gowitness", fmt.Sprintf("linux-%s", a), "", "gowitness"),
+            i.goCmd("github.com/sensepost/gowitness"),
+        }},
 
-        // ── Build Dependencies (installed first) ─────────
-        {
-            Name:     "libpcap-dev",
-            Binary:   "",
-            Category: "build-dep",
-            Required: false,
-            InstallSteps: []InstallStep{
-                aptInstall("libpcap-dev"),
-            },
-        },
-        {
-            Name:     "unzip",
-            Binary:   "unzip",
-            Category: "build-dep",
-            Required: false,
-            InstallSteps: []InstallStep{
-                aptInstall("unzip"),
-            },
-        },
-        {
-            Name:     "curl",
-            Binary:   "curl",
-            Category: "build-dep",
-            Required: true,
-            InstallSteps: []InstallStep{
-                aptInstall("curl"),
-            },
-        },
-        {
-            Name:     "git",
-            Binary:   "git",
-            Category: "build-dep",
-            Required: true,
-            InstallSteps: []InstallStep{
-                aptInstall("git"),
-            },
-        },
+        // ── Utility ──
+        {Name: "anew", Binary: "anew", Category: "utility", Required: false, InstallSteps: []InstallStep{
+            i.goCmd("github.com/tomnomnom/anew"),
+        }},
     }
 }
 
-// ── Main Entry Point ────────────────────────────────────
-
 func (i *Installer) CheckAndInstall() error {
-    i.log.Info("Checking %d tools across all categories...", len(i.tools))
-    i.log.Info("System: %s/%s", i.osName, i.arch)
+    i.log.Info("Checking %d tools (%s/%s)...", len(i.tools), i.os, i.arch)
 
-    // ── Phase 0: Verify Go is installed ──
     if !i.commandExists("go") {
-        i.log.Error("Go is not installed! Install from https://go.dev/dl/")
-        return fmt.Errorf("go is not installed")
+        i.log.Error("Go not installed — https://go.dev/dl/")
+        return fmt.Errorf("go not installed")
     }
-    goVer, _ := i.getCommandOutput("go", "version")
-    i.log.Info("Go version: %s", strings.TrimSpace(goVer))
-
-    // Ensure GOPATH/bin is in PATH
+    goVer, _ := i.cmdOutput("go", "version")
+    i.log.Info("Go: %s", strings.TrimSpace(goVer))
     i.ensureGoPath()
 
-    // ── Phase 1: Refresh package lists ──
-    if i.osName == "linux" {
-        i.log.Info("Refreshing package lists (sudo apt-get update)...")
-        if err := i.runCommand("sudo apt-get update -qq"); err != nil {
-            i.log.Warn("apt-get update failed — apt installs may not work: %v", err)
-        } else {
-            i.aptReady = true
+    // Phase 1: apt update
+    if i.os == "linux" {
+        i.log.Info("Updating package lists...")
+        if err := i.run("sudo apt-get update -qq 2>/dev/null"); err != nil {
+            i.log.Warn("apt-get update failed: %v", err)
         }
     }
 
-    // ── Phase 2: Install build dependencies first ──
+    // Phase 2: Build deps
     i.log.Info("Checking build dependencies...")
-    for _, tool := range i.tools {
-        if tool.Category != "build-dep" {
+    for _, t := range i.tools {
+        if t.Category != "build-dep" {
             continue
         }
-        if tool.Binary != "" && i.commandExists(tool.Binary) {
-            i.log.Success("  ✓ %s — found", tool.Name)
+        if t.Binary != "" && i.commandExists(t.Binary) {
+            i.log.Success("  ✓ %s", t.Name)
             continue
         }
-        // For library packages (no binary), check via dpkg
-        if tool.Binary == "" {
-            if i.dpkgInstalled(tool.Name) {
-                i.log.Success("  ✓ %s — found", tool.Name)
-                continue
-            }
+        if t.Binary == "" && i.dpkgInstalled(t.Name) {
+            i.log.Success("  ✓ %s", t.Name)
+            continue
         }
-        i.log.Warn("  ✗ %s — installing...", tool.Name)
-        i.tryInstall(tool)
+        i.log.Warn("  ✗ %s — installing...", t.Name)
+        i.tryInstall(t)
     }
 
-    // ── Phase 3: Handle httpx binary conflict ──
+    // Phase 3: httpx conflict
     i.resolveHttpxConflict()
 
-    // ── Phase 4: Install all recon tools ──
-    var installed []string
-    var missing []string
-    var failed []string
+    // Phase 4: All recon tools
+    var installed, missing, failed []string
 
-    for _, tool := range i.tools {
-        if tool.Category == "build-dep" {
-            continue // already handled
+    for _, t := range i.tools {
+        if t.Category == "build-dep" {
+            continue
         }
-
-        // Special handling for httpx (already resolved in Phase 3)
-        if tool.Name == "httpx-pd" {
-            if i.isProjectDiscoveryHttpx() {
-                i.log.Success("  ✓ %s (%s) — found (projectdiscovery)", tool.Name, tool.Binary)
+        if t.Name == "httpx-pd" {
+            if i.isPDHttpx() {
+                i.log.Success("  ✓ %s (%s) — projectdiscovery", t.Name, t.Binary)
                 continue
             }
-        } else if i.commandExists(tool.Binary) {
-            i.log.Success("  ✓ %s (%s) — found", tool.Name, tool.Binary)
+        } else if i.commandExists(t.Binary) {
+            i.log.Success("  ✓ %s (%s)", t.Name, t.Binary)
             continue
         }
 
-        i.log.Warn("  ✗ %s (%s) — not found, attempting install...", tool.Name, tool.Binary)
-
-        if i.tryInstall(tool) {
-            installed = append(installed, tool.Name)
+        i.log.Warn("  ✗ %s (%s) — installing...", t.Name, t.Binary)
+        if i.tryInstall(t) {
+            installed = append(installed, t.Name)
+        } else if t.Required {
+            i.log.Error("    ✗ FAILED required: %s", t.Name)
+            failed = append(failed, t.Name)
         } else {
-            if tool.Required {
-                i.log.Error("    ✗ FAILED to install required tool: %s", tool.Name)
-                failed = append(failed, tool.Name)
-            } else {
-                i.log.Warn("    ✗ Could not install %s (optional, continuing)", tool.Name)
-                missing = append(missing, tool.Name)
-            }
+            i.log.Warn("    ✗ Optional missing: %s", t.Name)
+            missing = append(missing, t.Name)
         }
     }
 
-    // ── Phase 5: Post-install setup ──
+    // Phase 5: Post-install
     if i.commandExists("nuclei") {
         i.log.Info("Updating Nuclei templates...")
-        i.runCommand("nuclei -update-templates")
+        i.run("nuclei -update-templates 2>/dev/null")
     }
-
-    // Install SecLists wordlists if not present
-    i.installWordlists()
-
-    // ── Summary ──
-    alreadyInstalled := len(i.tools) - len(installed) - len(missing) - len(failed)
-    // Subtract build-dep count for accurate reporting
-    buildDepCount := 0
-    for _, t := range i.tools {
-        if t.Category == "build-dep" {
-            buildDepCount++
-        }
-    }
-    alreadyInstalled -= buildDepCount
+    i.installSecLists()
 
     i.log.Info("─── Installation Summary ───")
-    i.log.Info("  Already installed:  %d tools", alreadyInstalled)
-    i.log.Info("  Newly installed:    %d tools", len(installed))
-    i.log.Info("  Optional missing:   %d tools", len(missing))
-    i.log.Info("  Required failures:  %d tools", len(failed))
+    i.log.Info("  Newly installed: %d", len(installed))
+    i.log.Info("  Optional missing: %d", len(missing))
+    i.log.Info("  Required failures: %d", len(failed))
 
     if len(failed) > 0 {
-        return fmt.Errorf("failed to install required tools: %s", strings.Join(failed, ", "))
+        return fmt.Errorf("failed: %s", strings.Join(failed, ", "))
     }
     return nil
 }
 
-// ── Installation Methods ────────────────────────────────
-
 func (i *Installer) tryInstall(tool Tool) bool {
     for _, step := range tool.InstallSteps {
-        i.log.Debug("    Trying method: %v", step.Method)
-
-        var success bool
+        var ok bool
         switch step.Method {
         case MethodGoInstall:
-            success = i.installViaGo(step.Command, tool.Binary)
+            ok = i.doGoInstall(step.Command, tool.Binary)
         case MethodApt:
-            success = i.installViaApt(step.Command, tool.Binary)
+            ok = i.doApt(step.Command, tool.Binary, tool.Name)
         case MethodGitHubRelease:
-            success = i.installViaGitHubRelease(step, tool.Binary)
+            ok = i.doGHRelease(step, tool.Binary)
         case MethodGitCloneMake:
-            success = i.installViaGitClone(step, tool.Binary)
+            ok = i.doGitClone(step, tool.Binary)
         case MethodCargoInstall:
-            success = i.installViaCargo(step.Command, tool.Binary)
+            ok = i.doRun(step.Command, tool.Binary, "cargo")
         case MethodPipInstall:
-            success = i.installViaPip(step.Command, tool.Binary)
+            ok = i.doRun(step.Command, tool.Binary, "pip3")
         case MethodBrew:
-            success = i.installViaBrew(step.Command, tool.Binary)
-        case MethodSnap:
-            success = i.installViaSnap(step.Command, tool.Binary)
+            ok = i.doRun(step.Command, tool.Binary, "brew")
         case MethodCustomScript:
-            success = i.installViaScript(step.Script, tool.Binary)
+            ok = i.doScript(step.Script, tool.Binary)
         }
-
-        if success {
-            i.log.Success("    ✓ Successfully installed %s", tool.Name)
+        if ok {
+            i.log.Success("    ✓ Installed %s", tool.Name)
             return true
         }
     }
     return false
 }
 
-func (i *Installer) installViaGo(command string, binary string) bool {
+func (i *Installer) doGoInstall(cmd, bin string) bool {
     if !i.commandExists("go") {
         return false
     }
-    err := i.runCommand(command)
-    if err != nil {
-        i.log.Warn("    Install attempt failed: %s — %v", command, err)
+    if err := i.run(cmd); err != nil {
+        i.log.Warn("    go install failed: %v", err)
         return false
     }
-    return binary == "" || i.commandExists(binary)
+    return bin == "" || i.commandExists(bin)
 }
 
-func (i *Installer) installViaApt(command string, binary string) bool {
-    if i.osName != "linux" {
+func (i *Installer) doApt(cmd, bin, name string) bool {
+    if i.os != "linux" {
         return false
     }
-    err := i.runCommand(command)
-    if err != nil {
-        i.log.Warn("    Install attempt failed: %s — %v", command, err)
+    if err := i.run(cmd); err != nil {
+        i.log.Warn("    apt failed: %s — %v", cmd, err)
         return false
     }
-    // For library packages (binary == ""), check dpkg
-    if binary == "" {
-        return true
+    if bin == "" {
+        return i.dpkgInstalled(name)
     }
-    return i.commandExists(binary)
+    return i.commandExists(bin)
 }
 
-func (i *Installer) installViaBrew(command string, binary string) bool {
-    if !i.commandExists("brew") {
+func (i *Installer) doRun(cmd, bin, requires string) bool {
+    if requires != "" && !i.commandExists(requires) {
         return false
     }
-    err := i.runCommand(command)
-    if err != nil {
-        i.log.Warn("    Install attempt failed: %s — %v", command, err)
+    if err := i.run(cmd); err != nil {
+        i.log.Warn("    failed: %s — %v", cmd, err)
         return false
     }
-    return binary == "" || i.commandExists(binary)
+    return bin == "" || i.commandExists(bin)
 }
 
-func (i *Installer) installViaCargo(command string, binary string) bool {
-    if !i.commandExists("cargo") {
-        i.log.Debug("    cargo not found, skipping Rust install")
-        return false
-    }
-    err := i.runCommand(command)
-    if err != nil {
-        i.log.Warn("    Install attempt failed: %s — %v", command, err)
-        return false
-    }
-    return binary == "" || i.commandExists(binary)
-}
-
-func (i *Installer) installViaPip(command string, binary string) bool {
-    if !i.commandExists("pip3") {
-        i.log.Debug("    pip3 not found, skipping Python install")
-        return false
-    }
-    err := i.runCommand(command)
-    if err != nil {
-        i.log.Warn("    Install attempt failed: %s — %v", command, err)
-        return false
-    }
-    return binary == "" || i.commandExists(binary)
-}
-
-func (i *Installer) installViaSnap(command string, binary string) bool {
-    if !i.commandExists("snap") {
-        return false
-    }
-    err := i.runCommand(command)
-    if err != nil {
-        i.log.Warn("    Install attempt failed: %s — %v", command, err)
-        return false
-    }
-    return binary == "" || i.commandExists(binary)
-}
-
-func (i *Installer) installViaScript(script []string, binary string) bool {
-    for _, cmd := range script {
-        if err := i.runCommand(cmd); err != nil {
-            i.log.Warn("    Script step failed: %s — %v", cmd, err)
+func (i *Installer) doScript(cmds []string, bin string) bool {
+    for _, cmd := range cmds {
+        if err := i.run(cmd); err != nil {
+            i.log.Warn("    script failed: %s — %v", cmd, err)
             return false
         }
     }
-    return binary == "" || i.commandExists(binary)
+    return bin == "" || i.commandExists(bin)
+}
+
+func (i *Installer) doGitClone(step InstallStep, bin string) bool {
+    if !i.commandExists("git") {
+        return false
+    }
+    tmpDir := "/tmp/reconstorm_build"
+    os.RemoveAll(tmpDir)
+    if err := i.run(fmt.Sprintf("git clone --depth 1 %s %s", step.GitURL, tmpDir)); err != nil {
+        return false
+    }
+    defer os.RemoveAll(tmpDir)
+    for _, cmd := range step.BuildCmds {
+        if err := i.run(fmt.Sprintf("cd %s && %s", tmpDir, cmd)); err != nil {
+            i.log.Warn("    build failed: %s — %v", cmd, err)
+            return false
+        }
+    }
+    return bin == "" || i.commandExists(bin)
 }
 
 // ── GitHub Release Downloader ───────────────────────────
 
-type ghAsset struct {
-    Name               string `json:"name"`
-    BrowserDownloadURL string `json:"browser_download_url"`
+type ghAssetInfo struct {
+    Name string `json:"name"`
+    URL  string `json:"browser_download_url"`
+}
+type ghReleaseInfo struct {
+    Tag    string        `json:"tag_name"`
+    Assets []ghAssetInfo `json:"assets"`
 }
 
-type ghRelease struct {
-    TagName string    `json:"tag_name"`
-    Assets  []ghAsset `json:"assets"`
-}
-
-func (i *Installer) installViaGitHubRelease(step InstallStep, binary string) bool {
-    i.log.Debug("    Downloading from GitHub Releases: %s", step.GHRepo)
-
-    // Fetch latest release info from GitHub API
+func (i *Installer) doGHRelease(step InstallStep, bin string) bool {
     apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", step.GHRepo)
 
     client := &http.Client{Timeout: 30 * time.Second}
     resp, err := client.Get(apiURL)
     if err != nil {
-        i.log.Warn("    GitHub API request failed: %v", err)
+        i.log.Warn("    GH API error: %v", err)
         return false
     }
     defer resp.Body.Close()
 
     if resp.StatusCode != 200 {
-        i.log.Warn("    GitHub API returned status %d for %s", resp.StatusCode, step.GHRepo)
+        i.log.Warn("    GH API status %d for %s", resp.StatusCode, step.GHRepo)
         return false
     }
 
-    body, err := io.ReadAll(resp.Body)
-    if err != nil {
-        i.log.Warn("    Failed to read GitHub API response: %v", err)
-        return false
-    }
-
-    var release ghRelease
+    body, _ := io.ReadAll(resp.Body)
+    var release ghReleaseInfo
     if err := json.Unmarshal(body, &release); err != nil {
-        i.log.Warn("    Failed to parse GitHub release JSON: %v", err)
+        i.log.Warn("    GH JSON parse error: %v", err)
         return false
     }
 
     // Find matching asset
-    var downloadURL string
-    assetPattern := strings.ToLower(step.GHAsset)
+    var dlURL string
+    pattern := strings.ToLower(step.GHAsset)
 
-    for _, asset := range release.Assets {
-        name := strings.ToLower(asset.Name)
-        // Match the asset pattern (e.g., "linux_amd64") and extension
-        if strings.Contains(name, assetPattern) {
-            // If extension specified, match it too
-            if step.GHAssetExt != "" {
-                if strings.HasSuffix(name, "."+step.GHAssetExt) {
-                    downloadURL = asset.BrowserDownloadURL
-                    i.log.Debug("    Matched asset: %s", asset.Name)
-                    break
-                }
-            } else {
-                // No extension specified — prefer the raw binary (no .zip/.tar.gz)
-                if !strings.HasSuffix(name, ".zip") &&
-                    !strings.HasSuffix(name, ".tar.gz") &&
-                    !strings.HasSuffix(name, ".txt") &&
-                    !strings.HasSuffix(name, ".sha256") {
-                    downloadURL = asset.BrowserDownloadURL
-                    i.log.Debug("    Matched asset: %s", asset.Name)
-                    break
-                }
+    for _, a := range release.Assets {
+        name := strings.ToLower(a.Name)
+        if !strings.Contains(name, pattern) {
+            continue
+        }
+        // Skip checksums and signatures
+        if strings.HasSuffix(name, ".sha256") || strings.HasSuffix(name, ".sig") || strings.HasSuffix(name, ".txt") {
+            continue
+        }
+        if step.GHAssetExt != "" {
+            if strings.HasSuffix(name, "."+step.GHAssetExt) {
+                dlURL = a.URL
+                break
+            }
+        } else {
+            // Raw binary — skip archives
+            if !strings.HasSuffix(name, ".zip") && !strings.HasSuffix(name, ".tar.gz") && !strings.HasSuffix(name, ".deb") {
+                dlURL = a.URL
+                break
             }
         }
     }
 
-    if downloadURL == "" {
-        i.log.Warn("    No matching asset found for pattern '%s' in %s (release: %s)",
-            step.GHAsset, step.GHRepo, release.TagName)
+    if dlURL == "" {
+        i.log.Warn("    No matching asset for '%s' in %s %s", step.GHAsset, step.GHRepo, release.Tag)
         i.log.Debug("    Available assets:")
         for _, a := range release.Assets {
-            i.log.Debug("      - %s", a.Name)
+            i.log.Debug("      %s", a.Name)
         }
         return false
     }
 
-    i.log.Info("    Downloading %s %s...", step.GHRepo, release.TagName)
+    i.log.Info("    Downloading %s %s...", step.GHRepo, release.Tag)
 
-    // Download the asset
-    tmpDir := "/tmp/reconstorm_install"
+    tmpDir := "/tmp/reconstorm_gh"
     os.MkdirAll(tmpDir, 0755)
     defer os.RemoveAll(tmpDir)
 
-    downloadPath := filepath.Join(tmpDir, "download")
-    if err := i.downloadFile(downloadURL, downloadPath); err != nil {
+    dlPath := filepath.Join(tmpDir, "download")
+    if err := i.download(dlURL, dlPath); err != nil {
         i.log.Warn("    Download failed: %v", err)
         return false
     }
 
-    // Determine the binary name inside the archive
-    binaryName := binary
+    binaryName := bin
     if step.GHBinary != "" {
         binaryName = step.GHBinary
     }
 
-    installDir := "/usr/local/bin"
-
-    // Handle based on extension
     switch step.GHAssetExt {
     case "zip":
-        return i.extractZip(downloadPath, tmpDir, binaryName, installDir)
+        return i.extractAndInstall("unzip -o %s -d %s", dlPath, tmpDir, binaryName)
     case "tar.gz":
-        return i.extractTarGz(downloadPath, tmpDir, binaryName, installDir)
+        return i.extractAndInstall("tar -xzf %s -C %s", dlPath, tmpDir, binaryName)
     case "":
-        // Raw binary — just move it
-        destPath := filepath.Join(installDir, binaryName)
-        if err := i.runCommand(fmt.Sprintf("chmod +x %s && sudo mv %s %s", downloadPath, downloadPath, destPath)); err != nil {
-            i.log.Warn("    Failed to install binary: %v", err)
+        dest := filepath.Join("/usr/local/bin", binaryName)
+        if err := i.run(fmt.Sprintf("chmod +x %s && sudo mv %s %s", dlPath, dlPath, dest)); err != nil {
             return false
         }
-        return i.commandExists(binary)
-    default:
-        i.log.Warn("    Unknown asset extension: %s", step.GHAssetExt)
-        return false
+        return i.commandExists(bin)
     }
+    return false
 }
 
-func (i *Installer) downloadFile(url string, destPath string) error {
-    client := &http.Client{
-        Timeout: 5 * time.Minute,
-        CheckRedirect: func(req *http.Request, via []*http.Request) error {
-            return nil // follow redirects
-        },
-    }
-
-    resp, err := client.Get(url)
-    if err != nil {
-        return fmt.Errorf("HTTP GET failed: %w", err)
-    }
-    defer resp.Body.Close()
-
-    if resp.StatusCode != 200 {
-        return fmt.Errorf("HTTP %d", resp.StatusCode)
-    }
-
-    out, err := os.Create(destPath)
-    if err != nil {
-        return fmt.Errorf("cannot create file: %w", err)
-    }
-    defer out.Close()
-
-    written, err := io.Copy(out, resp.Body)
-    if err != nil {
-        return fmt.Errorf("download interrupted: %w", err)
-    }
-
-    i.log.Debug("    Downloaded %d bytes", written)
-    return nil
-}
-
-func (i *Installer) extractZip(zipPath, tmpDir, binaryName, installDir string) bool {
-    extractDir := filepath.Join(tmpDir, "extracted")
+func (i *Installer) extractAndInstall(extractFmt, dlPath, tmpDir, binaryName string) bool {
+    extractDir := filepath.Join(tmpDir, "out")
     os.MkdirAll(extractDir, 0755)
 
-    if err := i.runCommand(fmt.Sprintf("unzip -o %s -d %s", zipPath, extractDir)); err != nil {
-        i.log.Warn("    Unzip failed: %v", err)
+    cmd := fmt.Sprintf(extractFmt, dlPath, extractDir)
+    if err := i.run(cmd); err != nil {
+        i.log.Warn("    Extract failed: %v", err)
         return false
     }
 
-    return i.findAndInstallBinary(extractDir, binaryName, installDir)
-}
-
-func (i *Installer) extractTarGz(tarPath, tmpDir, binaryName, installDir string) bool {
-    extractDir := filepath.Join(tmpDir, "extracted")
-    os.MkdirAll(extractDir, 0755)
-
-    if err := i.runCommand(fmt.Sprintf("tar -xzf %s -C %s", tarPath, extractDir)); err != nil {
-        i.log.Warn("    Tar extraction failed: %v", err)
-        return false
-    }
-
-    return i.findAndInstallBinary(extractDir, binaryName, installDir)
-}
-
-func (i *Installer) findAndInstallBinary(searchDir, binaryName, installDir string) bool {
-    // Search recursively for the binary
-    var binaryPath string
-
-    filepath.Walk(searchDir, func(path string, info os.FileInfo, err error) error {
-        if err != nil {
-            return nil
-        }
-        if !info.IsDir() && info.Name() == binaryName {
-            binaryPath = path
+    // Find binary recursively
+    var found string
+    filepath.Walk(extractDir, func(path string, info os.FileInfo, err error) error {
+        if err == nil && !info.IsDir() && info.Name() == binaryName {
+            found = path
             return filepath.SkipAll
         }
         return nil
     })
 
-    if binaryPath == "" {
-        i.log.Warn("    Binary '%s' not found in extracted archive", binaryName)
-        // List what was extracted for debugging
-        filepath.Walk(searchDir, func(path string, info os.FileInfo, err error) error {
+    if found == "" {
+        i.log.Warn("    Binary '%s' not found in archive", binaryName)
+        filepath.Walk(extractDir, func(path string, info os.FileInfo, err error) error {
             if err == nil && !info.IsDir() {
-                i.log.Debug("      Found file: %s", path)
+                i.log.Debug("      file: %s (%d bytes)", info.Name(), info.Size())
             }
             return nil
         })
         return false
     }
 
-    destPath := filepath.Join(installDir, binaryName)
-    cmd := fmt.Sprintf("chmod +x %s && sudo mv %s %s", binaryPath, binaryPath, destPath)
-    if err := i.runCommand(cmd); err != nil {
-        i.log.Warn("    Failed to install %s to %s: %v", binaryName, installDir, err)
+    dest := filepath.Join("/usr/local/bin", binaryName)
+    if err := i.run(fmt.Sprintf("chmod +x %s && sudo mv %s %s", found, found, dest)); err != nil {
+        i.log.Warn("    Install to /usr/local/bin failed: %v", err)
         return false
     }
-
     return i.commandExists(binaryName)
 }
 
-// ── Git Clone + Build ───────────────────────────────────
-
-func (i *Installer) installViaGitClone(step InstallStep, binary string) bool {
-    if !i.commandExists("git") {
-        i.log.Debug("    git not found, skipping clone install")
-        return false
+func (i *Installer) download(url, dest string) error {
+    client := &http.Client{Timeout: 5 * time.Minute}
+    resp, err := client.Get(url)
+    if err != nil {
+        return err
     }
-
-    tmpDir := "/tmp/reconstorm_build"
-    os.RemoveAll(tmpDir)
-
-    // Clone
-    i.log.Debug("    Cloning %s...", step.GitURL)
-    if err := i.runCommand(fmt.Sprintf("git clone --depth 1 %s %s", step.GitURL, tmpDir)); err != nil {
-        i.log.Warn("    Git clone failed: %v", err)
-        return false
+    defer resp.Body.Close()
+    if resp.StatusCode != 200 {
+        return fmt.Errorf("HTTP %d", resp.StatusCode)
     }
-    defer os.RemoveAll(tmpDir)
-
-    // Run build commands
-    for _, cmd := range step.BuildCmds {
-        fullCmd := fmt.Sprintf("cd %s && %s", tmpDir, cmd)
-        if err := i.runCommand(fullCmd); err != nil {
-            i.log.Warn("    Build step failed: %s — %v", cmd, err)
-            return false
-        }
+    f, err := os.Create(dest)
+    if err != nil {
+        return err
     }
-
-    return binary == "" || i.commandExists(binary)
+    defer f.Close()
+    _, err = io.Copy(f, resp.Body)
+    return err
 }
 
 // ── httpx Conflict Resolution ───────────────────────────
 
 func (i *Installer) resolveHttpxConflict() {
-    i.log.Info("Checking httpx binary (Python vs ProjectDiscovery)...")
+    i.log.Info("Checking httpx binary...")
 
     if !i.commandExists("httpx") {
-        i.log.Debug("  httpx not found at all, will install fresh")
+        i.log.Debug("  httpx not found, will install fresh")
         return
     }
 
-    if i.isProjectDiscoveryHttpx() {
-        i.log.Success("  ✓ httpx is ProjectDiscovery version — no conflict")
+    if i.isPDHttpx() {
+        i.log.Success("  ✓ httpx is ProjectDiscovery version")
         return
     }
 
-    // It's the Python httpx — we need to resolve
-    i.log.Warn("  ⚠ Detected Python httpx — resolving conflict...")
+    i.log.Warn("  ⚠ Python httpx detected — resolving...")
 
-    pythonPath, _ := exec.LookPath("httpx")
-    i.log.Warn("  Python httpx location: %s", pythonPath)
-
-    // Strategy 1: Rename the Python binary
-    if pythonPath != "" {
-        newName := pythonPath + "-py"
-        err := i.runCommand(fmt.Sprintf("sudo mv %s %s", pythonPath, newName))
-        if err != nil {
-            i.log.Warn("  Could not rename Python httpx: %v", err)
-            // Strategy 2: Try to remove the apt package
-            i.runCommand("sudo apt-get remove -y python3-httpx 2>/dev/null")
+    pyPath, _ := exec.LookPath("httpx")
+    if pyPath != "" {
+        if err := i.run(fmt.Sprintf("sudo mv %s %s-py", pyPath, pyPath)); err != nil {
+            i.log.Warn("  Rename failed, trying apt remove...")
+            i.run("sudo apt-get remove -y python3-httpx 2>/dev/null")
         } else {
-            i.log.Success("  Renamed Python httpx to %s", newName)
+            i.log.Success("  Renamed %s → %s-py", pyPath, pyPath)
         }
     }
 
-    // Install ProjectDiscovery httpx
-    i.log.Info("  Installing ProjectDiscovery httpx...")
-
-    // Try go install first
+    // Install correct version
     if i.commandExists("go") {
-        if err := i.runCommand("go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest"); err == nil {
-            if i.isProjectDiscoveryHttpx() {
-                i.log.Success("  ✓ ProjectDiscovery httpx installed via go install")
-                return
-            }
-        }
-    }
-
-    // Fallback to GitHub Release
-    step := InstallStep{
-        Method:     MethodGitHubRelease,
-        GHRepo:     "projectdiscovery/httpx",
-        GHAsset:    fmt.Sprintf("linux_%s", i.arch),
-        GHAssetExt: "zip",
-        GHBinary:   "httpx",
-    }
-    if i.installViaGitHubRelease(step, "httpx") {
-        if i.isProjectDiscoveryHttpx() {
-            i.log.Success("  ✓ ProjectDiscovery httpx installed via GitHub Release")
+        i.run("go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest")
+        if i.isPDHttpx() {
+            i.log.Success("  ✓ ProjectDiscovery httpx installed")
             return
         }
     }
 
-    i.log.Error("  ✗ Failed to resolve httpx conflict — web probing may not work")
+    step := InstallStep{
+        GHRepo: "projectdiscovery/httpx", GHAsset: fmt.Sprintf("linux_%s", i.arch),
+        GHAssetExt: "zip", GHBinary: "httpx",
+    }
+    i.doGHRelease(step, "httpx")
 }
 
-func (i *Installer) isProjectDiscoveryHttpx() bool {
-    // ProjectDiscovery httpx responds to -version with "Current Version: ..."
-    // or contains "projectdiscovery" in its output
-    output, err := i.getCommandOutput("httpx", "-version")
+func (i *Installer) isPDHttpx() bool {
+    out, err := i.cmdOutputAll("httpx", "-version")
     if err != nil {
-        // Also try with just the binary — some versions output to stderr
-        output, err = i.getCommandOutputStderr("httpx", "-version")
-        if err != nil {
-            return false
+        return false
+    }
+    lower := strings.ToLower(out)
+    return strings.Contains(lower, "projectdiscovery") || strings.Contains(lower, "current version")
+}
+
+func (i *Installer) installSecLists() {
+    paths := []string{"/usr/share/seclists", "/usr/share/wordlists/seclists", "/opt/seclists"}
+    for _, p := range paths {
+        if _, err := os.Stat(p); err == nil {
+            i.log.Success("  ✓ SecLists: %s", p)
+            return
         }
     }
-
-    lower := strings.ToLower(output)
-    return strings.Contains(lower, "projectdiscovery") ||
-        strings.Contains(lower, "current version") ||
-        strings.Contains(lower, "pd") ||
-        strings.Contains(lower, "-list") // help text contains -list flag
-}
-
-// ── Wordlist Installation ───────────────────────────────
-
-func (i *Installer) installWordlists() {
-    seclistsPath := "/usr/share/seclists"
-    if _, err := os.Stat(seclistsPath); err == nil {
-        i.log.Success("  ✓ SecLists wordlists found at %s", seclistsPath)
+    i.log.Info("  Installing SecLists...")
+    if err := i.run("sudo apt-get install -y seclists 2>/dev/null"); err == nil {
         return
     }
-
-    // Try alternative locations
-    altPaths := []string{
-        "/usr/share/wordlists/seclists",
-        "/opt/seclists",
-    }
-    for _, p := range altPaths {
-        if _, err := os.Stat(p); err == nil {
-            i.log.Success("  ✓ SecLists found at %s", p)
-            return
-        }
-    }
-
-    i.log.Info("  Installing SecLists wordlists...")
-
-    // Try apt first
-    if i.aptReady {
-        if err := i.runCommand("sudo apt-get install -y seclists"); err == nil {
-            i.log.Success("  ✓ SecLists installed via apt")
-            return
-        }
-    }
-
-    // Fallback: clone from GitHub (shallow)
-    i.log.Info("  Cloning SecLists from GitHub (this may take a while)...")
-    if err := i.runCommand(fmt.Sprintf("sudo git clone --depth 1 https://github.com/danielmiessler/SecLists.git %s", seclistsPath)); err != nil {
-        i.log.Warn("  Could not install SecLists: %v", err)
-        i.log.Warn("  Fuzzing modules may have limited wordlists")
-    } else {
-        i.log.Success("  ✓ SecLists installed to %s", seclistsPath)
-    }
+    i.run("sudo git clone --depth 1 https://github.com/danielmiessler/SecLists.git /usr/share/seclists")
 }
 
-// ── Utility Functions ───────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────
 
 func (i *Installer) commandExists(name string) bool {
     _, err := exec.LookPath(name)
@@ -1077,59 +619,37 @@ func (i *Installer) commandExists(name string) bool {
 }
 
 func (i *Installer) dpkgInstalled(pkg string) bool {
-    err := i.runCommand(fmt.Sprintf("dpkg -s %s 2>/dev/null | grep -q 'Status: install ok installed'", pkg))
-    return err == nil
+    return i.run(fmt.Sprintf("dpkg -s %s 2>/dev/null | grep -q 'install ok installed'", pkg)) == nil
 }
 
-func (i *Installer) runCommand(command string) error {
-    var cmd *exec.Cmd
-    if i.osName == "windows" {
-        cmd = exec.Command("cmd", "/C", command)
-    } else {
-        cmd = exec.Command("bash", "-c", command)
-    }
-
+func (i *Installer) run(command string) error {
+    cmd := exec.Command("bash", "-c", command)
     cmd.Env = os.Environ()
-
-    output, err := cmd.CombinedOutput()
+    out, err := cmd.CombinedOutput()
     if err != nil {
-        i.log.Debug("    Command output: %s", strings.TrimSpace(string(output)))
-        return fmt.Errorf("%v", err)
+        i.log.Debug("    cmd failed: %s — %s", command, strings.TrimSpace(string(out)))
     }
-    return nil
+    return err
 }
 
-func (i *Installer) getCommandOutput(name string, args ...string) (string, error) {
-    cmd := exec.Command(name, args...)
-    output, err := cmd.Output()
-    return string(output), err
+func (i *Installer) cmdOutput(name string, args ...string) (string, error) {
+    out, err := exec.Command(name, args...).Output()
+    return string(out), err
 }
 
-func (i *Installer) getCommandOutputStderr(name string, args ...string) (string, error) {
-    cmd := exec.Command(name, args...)
-    output, err := cmd.CombinedOutput()
-    return string(output), err
+func (i *Installer) cmdOutputAll(name string, args ...string) (string, error) {
+    out, err := exec.Command(name, args...).CombinedOutput()
+    return string(out), err
 }
 
 func (i *Installer) ensureGoPath() {
     home, _ := os.UserHomeDir()
-    goPaths := []string{
-        filepath.Join(home, "go", "bin"),
-        "/usr/local/go/bin",
-    }
-
-    path := os.Getenv("PATH")
-    modified := false
-
-    for _, gp := range goPaths {
-        if !strings.Contains(path, gp) {
-            path = gp + ":" + path
-            modified = true
+    paths := []string{filepath.Join(home, "go", "bin"), "/usr/local/go/bin"}
+    p := os.Getenv("PATH")
+    for _, gp := range paths {
+        if !strings.Contains(p, gp) {
+            p = gp + ":" + p
         }
     }
-
-    if modified {
-        os.Setenv("PATH", path)
-        i.log.Debug("  Updated PATH to include Go binary directories")
-    }
+    os.Setenv("PATH", p)
 }
