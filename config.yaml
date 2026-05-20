@@ -1,0 +1,58 @@
+# ═══════════════════════════════════════════════════════════════
+# ReconStorm Configuration File
+# ═══════════════════════════════════════════════════════════════
+
+general:
+  threads: 10
+  timeout: 300
+  verbose: true
+  notify_enabled: false
+  notify_provider: discord
+
+api_keys:
+  shodan: "YOUR_SHODAN_API_KEY"
+  censys_id: "YOUR_CENSYS_API_ID"
+  censys_secret: "YOUR_CENSYS_API_SECRET"
+  github_token: "YOUR_GITHUB_TOKEN"
+  virustotal: "YOUR_VT_API_KEY"
+
+stage1:
+  subfinder_threads: 30
+  amass_timeout: 15
+  amass_passive: true
+  resolve_subdomains: true
+
+stage2:
+  httpx_threads: 50
+  httpx_rate_limit: 150
+  screenshot_threads: 10
+  tech_detect: true
+
+stage3:
+  naabu_rate: 5000
+  naabu_top_ports: 1000
+  nmap_scripts: "default,vuln"
+  masscan_rate: 10000
+  full_port_scan: false
+
+stage4:
+  github_dork_delay: 5
+  google_dork_delay: 10
+  theharvester_sources: "google,bing,linkedin,twitter,dnsdumpster"
+  gitleaks_depth: 5
+  trufflehog_verified_only: true
+
+stage5:
+  monitor_interval_hours: 6
+  notify_new_subdomains: true
+  notify_new_ports: true
+  notify_new_vulns: true
+  nuclei_severity: "critical,high,medium"
+  nuclei_rate_limit: 150
+
+content_discovery:
+  wordlist: "/usr/share/wordlists/seclists/Discovery/Web-Content/common.txt"
+  ffuf_threads: 40
+  ffuf_rate: 0
+  extensions: "php,asp,aspx,jsp,html,js,json,xml,txt,bak,old,config"
+  feroxbuster_depth: 3
