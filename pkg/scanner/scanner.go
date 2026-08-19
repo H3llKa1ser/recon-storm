@@ -3,6 +3,7 @@ package scanner
 import (
     "context"
     "fmt"
+    "path/filepath"
     "sync"
     "time"
 
@@ -54,6 +55,48 @@ func New(cfg *config.Config, sm *state.Manager, log *logger.Logger) *Scanner {
     return s
 }
 
+// moduleInputs lists, per module, the candidate input files it can consume. A
+// module is skipped (with a reason) only when none of its inputs exist, which
+// turns the previous silent "return nil" into an explicit, reported outcome.
+func (s *Scanner) moduleInputs(domain, module string) []string {
+    d := func(parts ...string) string {
+        return filepath.Join(append([]string{s.cfg.OutputDir, domain}, parts...)...)
+    }
+    switch module {
+    case "dns":
+        return []string{d("subdomains", "all_subdomains.txt")}
+    case "ports":
+        return []string{d("dns", "live_hosts.txt"), d("subdomains", "all_subdomains.txt")}
+    case "web":
+        return []string{d("ports", "host_ports.txt"), d("dns", "live_hosts.txt"), d("subdomains", "all_subdomains.txt")}
+    case "endpoints":
+        return []string{d("subdomains", "all_subdomains.txt"), d("web", "live_urls.txt")}
+    case "vulns":
+        return []string{d("web", "live_urls.txt")}
+    case "secrets":
+        return []string{d("web", "live_urls.txt"), d("endpoints", "js_files.txt")}
+    case "screenshots":
+        return []string{d("web", "live_urls.txt")}
+    default:
+        return nil // no declared prerequisites
+    }
+}
+
+// prerequisiteMissing returns true and a human reason when a module has declared
+// inputs and none of them are present.
+func (s *Scanner) prerequisiteMissing(domain, module string) (bool, string) {
+    inputs := s.moduleInputs(domain, module)
+    if len(inputs) == 0 {
+        return false, ""
+    }
+    for _, p := range inputs {
+        if fileExists(p) {
+            return false, ""
+        }
+    }
+    return true, fmt.Sprintf("no input available (expected one of: %v)", baseNames(inputs))
+}
+
 func (s *Scanner) Run() error {
     s.state.SetDomains(s.cfg.Domains)
 
@@ -61,53 +104,108 @@ func (s *Scanner) Run() error {
     s.state.AutoSave(30*time.Second, stop)
     defer close(stop)
 
-    var errs []error
+    concurrency := s.cfg.DomainConcurrency
+    if concurrency < 1 {
+        concurrency = 1
+    }
+    if concurrency > len(s.cfg.Domains) {
+        concurrency = len(s.cfg.Domains)
+    }
+
+    var (
+        errMu sync.Mutex
+        errs  []error
+        sem   = make(chan struct{}, concurrency)
+        wg    sync.WaitGroup
+    )
+
+    if concurrency > 1 {
+        s.log.Info("Scanning %d domains with up to %d in parallel", len(s.cfg.Domains), concurrency)
+    }
 
     for _, domain := range s.cfg.Domains {
-        s.log.Section(fmt.Sprintf("SCANNING: %s", domain))
-
-        for _, mod := range s.modules {
-            key := fmt.Sprintf("%s_%s", domain, mod.Name())
-
-            if s.cfg.Resume && s.state.IsModuleCompleted(key) {
-                s.log.Info("  ⏭ Skipping %s (completed)", mod.Name())
-                continue
-            }
-
-            s.log.Section(fmt.Sprintf("MODULE: %s → %s", mod.Name(), domain))
-
-            ctx, cancel := context.WithTimeout(context.Background(), s.cfg.ModuleTimeout)
-
-            result := &state.ModuleResult{
-                Name:      key,
-                Status:    state.StatusRunning,
-                StartTime: time.Now(),
-            }
-            s.state.SetModuleResult(key, result)
-            s.state.Save()
-
-            err := s.runSafe(ctx, mod, domain)
-            cancel()
-
-            result.EndTime = time.Now()
-            if err != nil {
-                result.Status = state.StatusFailed
-                result.Error = err.Error()
-                s.log.Error("  %s failed: %v", mod.Name(), err)
+        domain := domain
+        wg.Add(1)
+        sem <- struct{}{}
+        go func() {
+            defer wg.Done()
+            defer func() { <-sem }()
+            if err := s.scanDomain(domain); err != nil {
+                errMu.Lock()
                 errs = append(errs, err)
-            } else {
-                result.Status = state.StatusCompleted
-                s.log.Success("  %s completed in %v", mod.Name(),
-                    result.EndTime.Sub(result.StartTime).Round(time.Millisecond))
+                errMu.Unlock()
             }
-
-            s.state.SetModuleResult(key, result)
-            s.state.Save()
-        }
+        }()
     }
+    wg.Wait()
 
     if len(errs) > 0 {
         return fmt.Errorf("%d module(s) had errors", len(errs))
+    }
+    return nil
+}
+
+// scanDomain runs the module chain for a single domain sequentially, preserving
+// the data dependencies between modules (dns needs subdomains, web needs dns…).
+func (s *Scanner) scanDomain(domain string) error {
+    s.log.Section(fmt.Sprintf("SCANNING: %s", domain))
+    var errs []error
+
+    for _, mod := range s.modules {
+        key := fmt.Sprintf("%s_%s", domain, mod.Name())
+
+        if s.cfg.Resume && s.state.IsModuleCompleted(key) {
+            s.log.Info("  ⏭ Skipping %s (completed)", mod.Name())
+            continue
+        }
+
+        // Dependency gate: record an explicit skip instead of a silent success.
+        if missing, reason := s.prerequisiteMissing(domain, mod.Name()); missing {
+            s.log.Warn("  ⏭ Skipping %s → %s: %s", mod.Name(), domain, reason)
+            s.state.SetModuleResult(key, &state.ModuleResult{
+                Name:       key,
+                Status:     state.StatusSkipped,
+                StartTime:  time.Now(),
+                EndTime:    time.Now(),
+                SkipReason: reason,
+            })
+            s.state.Save()
+            continue
+        }
+
+        s.log.Section(fmt.Sprintf("MODULE: %s → %s", mod.Name(), domain))
+
+        ctx, cancel := context.WithTimeout(context.Background(), s.cfg.ModuleTimeout)
+
+        result := &state.ModuleResult{
+            Name:      key,
+            Status:    state.StatusRunning,
+            StartTime: time.Now(),
+        }
+        s.state.SetModuleResult(key, result)
+        s.state.Save()
+
+        err := s.runSafe(ctx, mod, domain)
+        cancel()
+
+        result.EndTime = time.Now()
+        if err != nil {
+            result.Status = state.StatusFailed
+            result.Error = err.Error()
+            s.log.Error("  %s failed: %v", mod.Name(), err)
+            errs = append(errs, err)
+        } else {
+            result.Status = state.StatusCompleted
+            s.log.Success("  %s completed in %v", mod.Name(),
+                result.EndTime.Sub(result.StartTime).Round(time.Millisecond))
+        }
+
+        s.state.SetModuleResult(key, result)
+        s.state.Save()
+    }
+
+    if len(errs) > 0 {
+        return fmt.Errorf("%d module(s) failed for %s", len(errs), domain)
     }
     return nil
 }
@@ -119,11 +217,13 @@ func (s *Scanner) runSafe(ctx context.Context, mod Module, domain string) (err e
         }
     }()
 
-    var wg sync.WaitGroup
     ch := make(chan error, 1)
-    wg.Add(1)
     go func() {
-        defer wg.Done()
+        defer func() {
+            if r := recover(); r != nil {
+                ch <- fmt.Errorf("panic: %v", r)
+            }
+        }()
         ch <- mod.Run(ctx, domain)
     }()
 
@@ -133,4 +233,12 @@ func (s *Scanner) runSafe(ctx context.Context, mod Module, domain string) (err e
     case <-ctx.Done():
         return fmt.Errorf("timeout after %v", s.cfg.ModuleTimeout)
     }
+}
+
+func baseNames(paths []string) []string {
+    out := make([]string, len(paths))
+    for i, p := range paths {
+        out[i] = filepath.Base(filepath.Dir(p)) + "/" + filepath.Base(p)
+    }
+    return out
 }
