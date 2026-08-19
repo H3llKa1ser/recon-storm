@@ -7,6 +7,7 @@ import (
     "os"
     "os/exec"
     "path/filepath"
+    "strings"
 
     "github.com/H3llKa1ser/recon-storm/pkg/config"
     "github.com/H3llKa1ser/recon-storm/pkg/logger"
@@ -65,7 +66,6 @@ func (m *WebModule) Run(ctx context.Context, domain string) error {
         m.log.Warn("  httpx error: %v — %s", err, string(out))
     }
 
-    // Parse JSON results
     lines := readLines(httpxJSON)
     var liveURLs []string
 
@@ -86,19 +86,28 @@ func (m *WebModule) Run(ctx context.Context, domain string) error {
             sc = fmt.Sprintf("%.0f", v)
         }
         title, _ := result["title"].(string)
+        server, _ := result["webserver"].(string)
+
+        // Join tech names into a readable comma-separated string instead of Go's
+        // default slice formatting ("[nginx php]").
         tech := ""
         if techs, ok := result["tech"].([]interface{}); ok {
-            strs := make([]string, len(techs))
-            for i, t := range techs {
-                strs[i] = fmt.Sprintf("%v", t)
+            strs := make([]string, 0, len(techs))
+            for _, t := range techs {
+                strs = append(strs, fmt.Sprintf("%v", t))
             }
-            tech = fmt.Sprintf("%v", strs)
+            tech = strings.Join(strs, ", ")
         }
 
         m.state.AddFinding(state.Finding{
             Type: "web_server", Value: url, Source: "httpx",
             Domain: domain, Severity: "info",
-            Metadata: map[string]string{"status_code": sc, "title": title, "tech": tech},
+            Metadata: map[string]string{
+                "status_code": sc,
+                "title":       title,
+                "server":      server,
+                "tech":        tech,
+            },
         })
     }
 
