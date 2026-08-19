@@ -32,6 +32,7 @@ func TestReporterFixes(t *testing.T) {
     sm.AddFinding(state.Finding{Type: "vulnerability", Value: "[critical] Bad", Source: "nuclei", Domain: "example.com", Severity: "critical"})
     sm.AddFinding(state.Finding{Type: "sensitive_endpoint", Value: "https://example.com/admin", Source: "endpoint_analysis", Domain: "example.com", Severity: "low"})
     sm.AddFinding(state.Finding{Type: "web_server", Value: "https://a.example.com", Source: "httpx", Domain: "example.com", Severity: "info"})
+    sm.AddFinding(state.Finding{Type: "secret", Value: "AKIAIOSFODNN7EXAMPLE1234", Source: "js_analysis", Domain: "example.com", Severity: "high", Metadata: map[string]string{"rule": "AWS access key"}})
 
     r := New(cfg, sm, log)
     if err := r.Generate(); err != nil {
@@ -73,5 +74,27 @@ func TestReporterFixes(t *testing.T) {
     }
     if !strings.Contains(ms, "Triage") {
         t.Error("Markdown missing triage section")
+    }
+
+    // Secret redaction: the raw value must not appear in any generated report,
+    // but the last-4 correlation suffix should.
+    jsonReport, _ := os.ReadFile(filepath.Join(dir, "reports", "report.json"))
+    for name, content := range map[string]string{"html": hs, "md": ms, "json": string(jsonReport)} {
+        if strings.Contains(content, "AKIAIOSFODNN7EXAMPLE1234") {
+            t.Errorf("%s report leaks raw secret value", name)
+        }
+        if !strings.Contains(content, "1234") {
+            t.Errorf("%s report missing redacted secret suffix", name)
+        }
+    }
+    // Full value must survive in working state (only findings are redacted in reports).
+    rawFound := false
+    for _, f := range sm.GetFindings() {
+        if f.Type == "secret" && f.Value == "AKIAIOSFODNN7EXAMPLE1234" {
+            rawFound = true
+        }
+    }
+    if !rawFound {
+        t.Error("state findings should retain the full secret value")
     }
 }
