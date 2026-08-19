@@ -16,6 +16,7 @@ type Config struct {
     OutputDir         string
     Threads           int
     DomainConcurrency int
+    NucleiExcludeTags string
     GlobalTimeout     time.Duration
     ModuleTimeout     time.Duration
     SkipInstall   bool
