@@ -3,6 +3,7 @@ package scanner
 import (
     "context"
     "crypto/rand"
+    "crypto/sha256"
     "encoding/hex"
     "encoding/json"
     "fmt"
@@ -44,20 +45,18 @@ func (m *VulnModule) Run(ctx context.Context, domain string) error {
 
     urlCount := countFileLines(liveURLsFile)
 
-    // ── Nuclei ──
     if toolExists("nuclei") {
         m.runNuclei(ctx, domain, outDir, liveURLsFile, urlCount)
     } else {
         m.log.Warn("  Nuclei not found — install for comprehensive vuln scanning")
     }
 
-    // ── Custom sensitive path checks with FP reduction ──
     m.customChecks(ctx, domain, outDir, liveURLsFile)
 
     return nil
 }
 
-// ── Nuclei with smart filtering ─────────────────────────
+// ── Nuclei ───────────────────────────────────────────────
 
 func (m *VulnModule) runNuclei(ctx context.Context, domain, outDir, liveURLsFile string, urlCount int) {
     m.log.Info("  Running Nuclei on %d live URLs...", urlCount)
@@ -93,7 +92,6 @@ func (m *VulnModule) runNuclei(ctx context.Context, domain, outDir, liveURLsFile
 
 func (m *VulnModule) parseNucleiResults(jsonFile string, domain string) {
     lines := readLines(jsonFile)
-    count := 0
 
     for _, line := range lines {
         var result map[string]interface{}
@@ -102,15 +100,15 @@ func (m *VulnModule) parseNucleiResults(jsonFile string, domain string) {
         }
 
         templateID, _ := result["template-id"].(string)
-        severity, name := "", ""
+        severity, name, description := "", "", ""
         if info, ok := result["info"].(map[string]interface{}); ok {
             severity, _ = info["severity"].(string)
             name, _ = info["name"].(string)
+            description, _ = info["description"].(string)
         }
         matchedAt, _ := result["matched-at"].(string)
         matcherName, _ := result["matcher-name"].(string)
 
-        // Skip info-level noise
         if strings.ToLower(severity) == "info" {
             continue
         }
@@ -122,33 +120,29 @@ func (m *VulnModule) parseNucleiResults(jsonFile string, domain string) {
             Metadata: map[string]string{
                 "template_id": templateID, "name": name,
                 "matched_at": matchedAt, "matcher_name": matcherName,
+                "description": firstNonEmpty(description, name),
             },
         })
-        count++
     }
-
-    m.state.UpdateStats(func(s *state.ScanStats) {
-        s.TotalVulns += count
-    })
 }
 
-// ── Custom Checks with Full FP Reduction ────────────────
+// ── Custom Checks with False-Positive Reduction ─────────
 
-// baseline fingerprint for a host's catch-all response
 type responseFingerprint struct {
     StatusCode    int
     ContentLength int
     RedirectTo    string
+    BodyHash      string
+    valid         bool
 }
 
-// sensitivePathCheck defines a path to check with its validation logic
 type sensitivePathCheck struct {
-    Path           string
-    Severity       string
-    Description    string
-    MinBodySize    int
-    BodyValidator  func(body []byte) bool
-    SkipRedirects  bool   // if true, any redirect = not exposed
+    Path          string
+    Severity      string
+    Description   string
+    MinBodySize   int
+    BodyValidator func(body []byte) bool
+    SkipRedirects bool
 }
 
 func (m *VulnModule) customChecks(ctx context.Context, domain, outDir, urlsFile string) {
@@ -159,14 +153,12 @@ func (m *VulnModule) customChecks(ctx context.Context, domain, outDir, urlsFile 
 
     m.log.Info("  Running validated sensitive path checks...")
 
-    // Define all checks with validation rules
     checks := m.defineChecks()
     m.log.Info("  Checking %d sensitive paths across %d hosts...", len(checks), len(urls))
 
     client := &http.Client{
         Timeout: 10 * time.Second,
         CheckRedirect: func(req *http.Request, via []*http.Request) error {
-            // Don't follow redirects — we want to inspect them
             return http.ErrUseLastResponse
         },
     }
@@ -177,10 +169,9 @@ func (m *VulnModule) customChecks(ctx context.Context, domain, outDir, urlsFile 
     for _, baseURL := range urls {
         baseURL = strings.TrimRight(baseURL, "/")
 
-        // ── Step 1: Canary baseline request ──
-        baseline := m.getBaseline(ctx, client, baseURL)
-        m.log.Debug("  Baseline for %s: status=%d, size=%d, redirect=%s",
-            baseURL, baseline.StatusCode, baseline.ContentLength, baseline.RedirectTo)
+        // Multiple canaries with different path shapes fingerprint catch-all
+        // behaviour more robustly than a single probe.
+        baselines := m.getBaselines(ctx, client, baseURL)
 
         for _, check := range checks {
             targetURL := baseURL + check.Path
@@ -190,56 +181,44 @@ func (m *VulnModule) customChecks(ctx context.Context, domain, outDir, urlsFile 
                 continue
             }
 
-            // ── Step 2: Compare against baseline (catch-all detection) ──
-            if m.matchesBaseline(resp, body, baseline) {
+            if m.matchesAnyBaseline(resp, body, baselines) {
                 totalFPFiltered++
                 m.log.Debug("    FP filtered (baseline match): %s", check.Path)
                 continue
             }
 
-            // ── Step 3: Redirect destination filtering ──
             if resp.StatusCode == 301 || resp.StatusCode == 302 || resp.StatusCode == 303 || resp.StatusCode == 307 || resp.StatusCode == 308 {
                 if check.SkipRedirects {
                     totalFPFiltered++
-                    m.log.Debug("    FP filtered (redirect): %s → %s", check.Path, resp.Header.Get("Location"))
                     continue
                 }
-
                 location := strings.ToLower(resp.Header.Get("Location"))
                 if m.isCatchAllRedirect(location) {
                     totalFPFiltered++
-                    m.log.Debug("    FP filtered (catch-all redirect): %s → %s", check.Path, location)
                     continue
                 }
             }
 
-            // ── Step 4: Status code validation ──
             if resp.StatusCode == 404 || resp.StatusCode == 410 {
                 continue
             }
 
-            // ── Step 5: Minimum body size threshold ──
             if check.MinBodySize > 0 && len(body) < check.MinBodySize {
                 totalFPFiltered++
-                m.log.Debug("    FP filtered (too small: %d < %d): %s", len(body), check.MinBodySize, check.Path)
                 continue
             }
 
-            // ── Step 6: Content-specific validation ──
             if check.BodyValidator != nil && !check.BodyValidator(body) {
                 totalFPFiltered++
-                m.log.Debug("    FP filtered (content mismatch): %s", check.Path)
                 continue
             }
 
-            // ── Passed all checks — real finding ──
-            severity := check.Severity
             m.log.Success("  CONFIRMED: %s [%d] [%d bytes] — %s",
                 check.Path, resp.StatusCode, len(body), check.Description)
 
             m.state.AddFinding(state.Finding{
                 Type: "sensitive_file", Value: targetURL, Source: "custom_check",
-                Domain: domain, Severity: severity,
+                Domain: domain, Severity: check.Severity,
                 Metadata: map[string]string{
                     "status_code":    fmt.Sprintf("%d", resp.StatusCode),
                     "content_length": fmt.Sprintf("%d", len(body)),
@@ -252,7 +231,6 @@ func (m *VulnModule) customChecks(ctx context.Context, domain, outDir, urlsFile 
 
     m.log.Info("  Custom checks: %d confirmed, %d false positives filtered", totalFindings, totalFPFiltered)
 
-    // Write results summary
     summaryFile := filepath.Join(outDir, "custom_checks_summary.txt")
     writeLines(summaryFile, []string{
         fmt.Sprintf("Confirmed findings: %d", totalFindings),
@@ -262,41 +240,58 @@ func (m *VulnModule) customChecks(ctx context.Context, domain, outDir, urlsFile 
     })
 }
 
-// ── Canary Baseline ─────────────────────────────────────
-
-func (m *VulnModule) getBaseline(ctx context.Context, client *http.Client, baseURL string) responseFingerprint {
-    // Request a path that definitely doesn't exist
-    canary := randomString(16)
-    canaryURL := fmt.Sprintf("%s/reconstorm_canary_%s", baseURL, canary)
-
-    resp, body, err := m.doRequest(ctx, client, canaryURL)
-    if err != nil {
-        return responseFingerprint{StatusCode: -1}
+// getBaselines probes several non-existent paths of different shapes so the
+// catch-all fingerprint covers /foo, /foo.php and /.foo style handling.
+func (m *VulnModule) getBaselines(ctx context.Context, client *http.Client, baseURL string) []responseFingerprint {
+    shapes := []string{
+        "/reconstorm_canary_%s",
+        "/reconstorm_canary_%s.php",
+        "/.reconstorm_canary_%s",
     }
-
-    fp := responseFingerprint{
-        StatusCode:    resp.StatusCode,
-        ContentLength: len(body),
+    var fps []responseFingerprint
+    for _, shape := range shapes {
+        canaryURL := baseURL + fmt.Sprintf(shape, randomString(12))
+        resp, body, err := m.doRequest(ctx, client, canaryURL)
+        if err != nil {
+            continue
+        }
+        fp := responseFingerprint{
+            StatusCode:    resp.StatusCode,
+            ContentLength: len(body),
+            BodyHash:      hashBody(body),
+            valid:         true,
+        }
+        if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+            fp.RedirectTo = strings.ToLower(resp.Header.Get("Location"))
+        }
+        fps = append(fps, fp)
     }
+    return fps
+}
 
-    if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-        fp.RedirectTo = strings.ToLower(resp.Header.Get("Location"))
+func (m *VulnModule) matchesAnyBaseline(resp *http.Response, body []byte, baselines []responseFingerprint) bool {
+    for _, b := range baselines {
+        if m.matchesBaseline(resp, body, b) {
+            return true
+        }
     }
-
-    return fp
+    return false
 }
 
 func (m *VulnModule) matchesBaseline(resp *http.Response, body []byte, baseline responseFingerprint) bool {
-    if baseline.StatusCode == -1 {
-        return false // no baseline available
+    if !baseline.valid {
+        return false
     }
-
-    // Same status code
     if resp.StatusCode != baseline.StatusCode {
         return false
     }
 
-    // Same content length (within 10% tolerance)
+    // Byte-identical catch-all page (common for SPA/error handlers).
+    if baseline.BodyHash != "" && hashBody(body) == baseline.BodyHash {
+        return true
+    }
+
+    // Same content length within a 10% band (dynamic pages vary a little).
     if baseline.ContentLength > 0 {
         diff := abs(len(body) - baseline.ContentLength)
         tolerance := baseline.ContentLength / 10
@@ -308,18 +303,13 @@ func (m *VulnModule) matchesBaseline(resp *http.Response, body []byte, baseline 
         }
     }
 
-    // Same redirect destination
     if baseline.RedirectTo != "" {
-        location := strings.ToLower(resp.Header.Get("Location"))
-        if location == baseline.RedirectTo {
+        if strings.ToLower(resp.Header.Get("Location")) == baseline.RedirectTo {
             return true
         }
     }
-
     return false
 }
-
-// ── Redirect Analysis ───────────────────────────────────
 
 func (m *VulnModule) isCatchAllRedirect(location string) bool {
     catchAllPatterns := []string{
@@ -329,35 +319,26 @@ func (m *VulnModule) isCatchAllRedirect(location string) bool {
         "/welcome", "/dashboard",
         "sso.", "accounts.", "auth.",
     }
-
     for _, pattern := range catchAllPatterns {
         if strings.HasSuffix(location, pattern) || strings.Contains(location, pattern) {
             return true
         }
     }
-
-    // If redirect goes to a completely different domain, it's likely SSO/catch-all
-    // (e.g., redirecting to okta, auth0, etc.)
     ssoProviders := []string{"okta.", "auth0.", "onelogin.", "ping", "adfs.", "login.microsoftonline"}
     for _, sso := range ssoProviders {
         if strings.Contains(location, sso) {
             return true
         }
     }
-
     return false
 }
 
-// ── Check Definitions ───────────────────────────────────
-
 func (m *VulnModule) defineChecks() []sensitivePathCheck {
     return []sensitivePathCheck{
-        // ── HIGH SEVERITY — require body content validation ──
         {
             Path: "/.env", Severity: "high", Description: "Environment file with credentials",
             SkipRedirects: true, MinBodySize: 10,
             BodyValidator: func(body []byte) bool {
-                // Must contain KEY=VALUE patterns
                 return regexp.MustCompile(`(?m)^[A-Z_]{2,}=.+`).Match(body)
             },
         },
@@ -373,8 +354,11 @@ func (m *VulnModule) defineChecks() []sensitivePathCheck {
             Path: "/.git/HEAD", Severity: "high", Description: "Git HEAD reference exposed",
             SkipRedirects: true, MinBodySize: 10,
             BodyValidator: func(body []byte) bool {
-                s := string(body)
-                return strings.HasPrefix(s, "ref: refs/") || regexp.MustCompile(`^[a-f0-9]{40}`).MatchString(s)
+                s := strings.TrimSpace(string(body))
+                // SHA-1 (40 hex) or SHA-256 (64 hex) detached HEAD, or a symbolic ref.
+                return strings.HasPrefix(s, "ref: refs/") ||
+                    regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(s) ||
+                    regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(s)
             },
         },
         {
@@ -416,22 +400,18 @@ func (m *VulnModule) defineChecks() []sensitivePathCheck {
             SkipRedirects: true, MinBodySize: 10,
             BodyValidator: func(body []byte) bool {
                 s := string(body)
-                // SVN entries file starts with version number or contains "dir" entries
                 return regexp.MustCompile(`^\d+`).MatchString(strings.TrimSpace(s)) ||
-                    strings.Contains(s, "dir") && strings.Contains(s, "svn")
+                    (strings.Contains(s, "dir") && strings.Contains(s, "svn"))
             },
         },
         {
             Path: "/.htpasswd", Severity: "high", Description: "Apache password file exposed",
             SkipRedirects: true, MinBodySize: 10,
             BodyValidator: func(body []byte) bool {
-                // Format: username:password_hash
                 return regexp.MustCompile(`^[a-zA-Z0-9_-]+:\$`).Match(body) ||
                     regexp.MustCompile(`^[a-zA-Z0-9_-]+:\{`).Match(body)
             },
         },
-
-        // ── MEDIUM SEVERITY — structure/content validation ──
         {
             Path: "/server-status", Severity: "medium", Description: "Apache server-status exposed",
             SkipRedirects: true, MinBodySize: 200,
@@ -532,7 +512,6 @@ func (m *VulnModule) defineChecks() []sensitivePathCheck {
             Path: "/.DS_Store", Severity: "medium", Description: "macOS directory metadata exposed",
             SkipRedirects: true, MinBodySize: 8,
             BodyValidator: func(body []byte) bool {
-                // DS_Store files start with specific magic bytes
                 return len(body) >= 8 && body[0] == 0x00 && body[1] == 0x00 && body[2] == 0x00 && body[3] == 0x01
             },
         },
@@ -558,7 +537,6 @@ func (m *VulnModule) defineChecks() []sensitivePathCheck {
             SkipRedirects: true, MinBodySize: 30,
             BodyValidator: func(body []byte) bool {
                 s := string(body)
-                // Only flag if it allows all domains
                 return strings.Contains(s, "cross-domain-policy") &&
                     strings.Contains(s, "domain=\"*\"")
             },
@@ -571,8 +549,6 @@ func (m *VulnModule) defineChecks() []sensitivePathCheck {
                 return strings.Contains(s, "access-policy") && strings.Contains(s, "*")
             },
         },
-
-        // ── INFO SEVERITY — public files, no validation needed beyond existence ──
         {
             Path: "/robots.txt", Severity: "info", Description: "Robots.txt (may reveal hidden paths)",
             SkipRedirects: true, MinBodySize: 10,
@@ -618,12 +594,10 @@ func (m *VulnModule) doRequest(ctx context.Context, client *http.Client, url str
     }
     defer resp.Body.Close()
 
-    // Read body with a size limit to avoid downloading huge files
-    body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024)) // 1MB max
+    body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
     if err != nil {
         return resp, nil, err
     }
-
     return resp, body, nil
 }
 
@@ -633,6 +607,20 @@ func randomString(n int) string {
     bytes := make([]byte, n/2+1)
     rand.Read(bytes)
     return hex.EncodeToString(bytes)[:n]
+}
+
+func hashBody(body []byte) string {
+    sum := sha256.Sum256(body)
+    return hex.EncodeToString(sum[:])
+}
+
+func firstNonEmpty(vals ...string) string {
+    for _, v := range vals {
+        if strings.TrimSpace(v) != "" {
+            return v
+        }
+    }
+    return ""
 }
 
 func abs(x int) int {
