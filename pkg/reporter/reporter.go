@@ -83,6 +83,22 @@ func remediation(f state.Finding) string {
     }
 }
 
+// redactSecret masks a matched secret for report output, preserving only the
+// last 4 characters so an analyst can correlate it against the source without
+// the report itself carrying the live value.
+func redactSecret(v string) string {
+    v = strings.TrimSpace(v)
+    if len(v) <= 4 {
+        return strings.Repeat("•", len(v))
+    }
+    keep := v[len(v)-4:]
+    maskLen := len(v) - 4
+    if maskLen > 12 {
+        maskLen = 12
+    }
+    return strings.Repeat("•", maskLen) + keep
+}
+
 // sevClass maps a severity string to the two-letter CSS class the stylesheet
 // actually defines (cr/hi/md/lo/in). Previously the template interpolated the
 // raw severity ("high" -> sv-high) which matched no class, leaving badges
@@ -107,6 +123,15 @@ func (r *Reporter) buildData() ReportData {
     r.state.RecomputeStats()
 
     findings := r.state.GetFindings()
+    // Redact secret values in every generated report so a shared report.html /
+    // .md / .json can't leak live credentials. The full value remains only in
+    // the local working state.json. Redaction keeps the last 4 chars so an
+    // analyst can still correlate against the source.
+    for i := range findings {
+        if findings[i].Type == "secret" {
+            findings[i].Value = redactSecret(findings[i].Value)
+        }
+    }
     stats := r.state.GetStats()
     start := r.state.GetStartTime()
     end := r.state.GetEndTime()
