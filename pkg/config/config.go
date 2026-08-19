@@ -13,10 +13,11 @@ type Config struct {
     DomainListFile string
     Domains        []string
 
-    OutputDir     string
-    Threads       int
-    GlobalTimeout time.Duration
-    ModuleTimeout time.Duration
+    OutputDir         string
+    Threads           int
+    DomainConcurrency int
+    GlobalTimeout     time.Duration
+    ModuleTimeout     time.Duration
     SkipInstall   bool
     Resume        bool
     Modules       string
