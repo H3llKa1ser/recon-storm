@@ -34,6 +34,7 @@ func main() {
     outputDir := flag.String("o", "", "Output directory (default: ./recon-<domain>)")
     threads := flag.Int("t", 50, "Number of concurrent threads")
     domainConcurrency := flag.Int("domain-concurrency", 1, "Number of domains to scan in parallel (with -dL)")
+    nucleiExcludeTags := flag.String("nuclei-exclude-tags", "", "Comma-separated nuclei template tags to exclude (e.g. ssl,dns). Empty = run all.")
     timeout := flag.Duration("timeout", 45*time.Minute, "Global timeout for entire scan")
     moduleTimeout := flag.Duration("module-timeout", 10*time.Minute, "Timeout per scan module")
     skipInstall := flag.Bool("skip-install", false, "Skip tool installation check")
@@ -63,6 +64,7 @@ func main() {
         DomainListFile:    *domainList,
         Threads:           *threads,
         DomainConcurrency: *domainConcurrency,
+        NucleiExcludeTags: *nucleiExcludeTags,
         GlobalTimeout:     *timeout,
         ModuleTimeout:     *moduleTimeout,
         SkipInstall:       *skipInstall,
