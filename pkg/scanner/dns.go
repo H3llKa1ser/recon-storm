@@ -6,6 +6,7 @@ import (
     "os"
     "os/exec"
     "path/filepath"
+    "regexp"
     "strings"
 
     "github.com/H3llKa1ser/recon-storm/pkg/config"
@@ -37,16 +38,15 @@ func (m *DNSModule) Run(ctx context.Context, domain string) error {
     subCount := countFileLines(subsFile)
     m.log.Info("  DNS module processing %d subdomains", subCount)
 
-    // ── dnsx resolution ──
     if toolExists("dnsx") {
         m.log.Info("  Running dnsx for DNS resolution...")
 
-        // Step 1: Resolve and get plain text output (just hosts)
         resolvedFile := filepath.Join(outDir, "dnsx_resolved.txt")
         cmd := exec.CommandContext(ctx, "dnsx",
             "-l", subsFile,
             "-resp",
             "-a", "-aaaa", "-cname", "-mx", "-ns", "-txt",
+            "-wd", domain, // wildcard filtering against the base domain
             "-retry", "3",
             "-t", fmt.Sprintf("%d", m.cfg.Threads),
             "-silent",
@@ -57,21 +57,20 @@ func (m *DNSModule) Run(ctx context.Context, domain string) error {
             m.log.Warn("  dnsx error: %v — %s", err, strings.TrimSpace(string(out)))
         }
 
-        // Step 2: Separate JSON run for detailed records
         jsonFile := filepath.Join(outDir, "dnsx_full.jsonl")
         jsonCmd := exec.CommandContext(ctx, "dnsx",
             "-l", subsFile,
             "-resp",
             "-a", "-aaaa", "-cname",
+            "-wd", domain,
             "-retry", "2",
             "-t", fmt.Sprintf("%d", m.cfg.Threads),
             "-silent",
             "-json",
             "-o", jsonFile,
         )
-        jsonCmd.Run() // Best-effort, don't fail if this errors
+        jsonCmd.Run()
 
-        // Parse resolved hosts
         resolved := readLines(resolvedFile)
         m.log.Success("  dnsx resolved %d hosts", len(resolved))
 
@@ -81,47 +80,45 @@ func (m *DNSModule) Run(ctx context.Context, domain string) error {
 
         for _, line := range resolved {
             parts := strings.Fields(line)
-            if len(parts) > 0 {
-                host := strings.TrimSpace(parts[0])
-                // Deduplicate hosts
-                if !seen[host] {
-                    seen[host] = true
-                    liveHosts = append(liveHosts, host)
-                    m.state.AddFinding(state.Finding{
-                        Type: "dns_resolved", Value: line, Source: "dnsx",
-                        Domain: domain, Severity: "info",
-                        Metadata: map[string]string{"raw": line},
-                    })
-                }
+            if len(parts) == 0 {
+                continue
             }
+            host := strings.TrimSpace(parts[0])
+            if seen[host] {
+                continue
+            }
+            seen[host] = true
+            liveHosts = append(liveHosts, host)
+            m.state.AddFinding(state.Finding{
+                Type: "dns_resolved", Value: host, Source: "dnsx",
+                Domain: domain, Severity: "info",
+                Metadata: map[string]string{"raw": line},
+            })
         }
 
         writeLines(liveFile, liveHosts)
-
-        m.state.UpdateStats(func(s *state.ScanStats) {
-            s.TotalLiveHosts += len(liveHosts)
-        })
-
         m.log.Info("  %d unique live hosts written to %s", len(liveHosts), filepath.Base(liveFile))
     } else {
-        m.log.Warn("  dnsx not found — skipping DNS resolution")
+        m.log.Warn("  dnsx not found — skipping active DNS resolution")
         m.log.Warn("  Install: go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest")
 
-        // Fallback: use the subdomains list directly as "live hosts"
-        // so downstream modules have something to work with
+        // Fallback: treat enumerated subdomains as live hosts AND record them as
+        // findings so the recomputed live-host stat stays consistent.
         subsData := readLines(subsFile)
         if len(subsData) > 0 {
             liveFile := filepath.Join(outDir, "live_hosts.txt")
             writeLines(liveFile, subsData)
+            for _, h := range subsData {
+                m.state.AddFinding(state.Finding{
+                    Type: "dns_resolved", Value: h, Source: "fallback",
+                    Domain: domain, Severity: "info",
+                    Metadata: map[string]string{"note": "unresolved fallback (dnsx missing)"},
+                })
+            }
             m.log.Info("  Fallback: using %d subdomains as live hosts", len(subsData))
-
-            m.state.UpdateStats(func(s *state.ScanStats) {
-                s.TotalLiveHosts += len(subsData)
-            })
         }
     }
 
-    // Zone transfer — only in active mode
     if !m.cfg.PassiveOnly {
         m.log.Info("  Attempting zone transfer...")
         m.zoneTransfer(ctx, domain, outDir)
@@ -131,6 +128,10 @@ func (m *DNSModule) Run(ctx context.Context, domain string) error {
 
     return nil
 }
+
+// soaLine matches a resource record whose type field is SOA, tolerating the
+// variable whitespace dig emits.
+var soaLine = regexp.MustCompile(`(?mi)^\S+\s+\d+\s+IN\s+SOA\s`)
 
 func (m *DNSModule) zoneTransfer(ctx context.Context, domain string, outDir string) {
     if !toolExists("dig") {
@@ -163,41 +164,38 @@ func (m *DNSModule) zoneTransfer(ctx context.Context, domain string, outDir stri
         if err != nil {
             continue
         }
-
-        // Validate: real zone transfer has multiple record types
         output := string(axfrOut)
-        recordTypes := []string{" A ", " AAAA ", " CNAME ", " MX ", " TXT ", " NS ", " SOA ", " PTR ", " SRV "}
-        recordCount := 0
-        for _, rt := range recordTypes {
-            if strings.Contains(output, rt) {
-                recordCount++
-            }
-        }
 
-        lineCount := strings.Count(output, "\n")
+        // A successful AXFR is delimited by the SOA record: the transfer begins
+        // and ends with SOA, so a genuine transfer contains at least two SOA
+        // lines. This is the authoritative signal and avoids false positives
+        // from large TXT records or chatty refusals.
+        soaCount := len(soaLine.FindAllString(output, -1))
+        refused := strings.Contains(output, "Transfer failed") ||
+            strings.Contains(output, "; Transfer failed") ||
+            strings.Contains(output, "connection timed out") ||
+            strings.Contains(output, "communications error") ||
+            strings.Contains(output, "REFUSED")
 
-        // Must have 3+ record types AND 10+ lines AND NOT contain "Transfer failed"
-        if recordCount >= 3 && lineCount > 10 &&
-            !strings.Contains(output, "Transfer failed") &&
-            !strings.Contains(output, "; Transfer failed") &&
-            !strings.Contains(output, "connection timed out") {
-
+        if soaCount >= 2 && !refused {
+            lineCount := strings.Count(output, "\n")
             outFile := filepath.Join(outDir, fmt.Sprintf("zonetransfer_%s.txt", ns))
             os.WriteFile(outFile, axfrOut, 0644)
-            m.log.Success("  ZONE TRANSFER CONFIRMED from %s! (%d record types, %d lines)", ns, recordCount, lineCount)
+            m.log.Success("  ZONE TRANSFER CONFIRMED from %s! (SOA envelope present, %d lines)", ns, lineCount)
 
             m.state.AddFinding(state.Finding{
                 Type: "vuln", Value: fmt.Sprintf("Zone transfer possible from %s", ns),
                 Source: "dig", Domain: domain, Severity: "high",
                 Metadata: map[string]string{
-                    "nameserver":   ns,
-                    "file":         outFile,
-                    "record_types": fmt.Sprintf("%d", recordCount),
-                    "line_count":   fmt.Sprintf("%d", lineCount),
+                    "nameserver":  ns,
+                    "file":        outFile,
+                    "soa_records": fmt.Sprintf("%d", soaCount),
+                    "line_count":  fmt.Sprintf("%d", lineCount),
+                    "description": "Full DNS zone transfer permitted; discloses all records for the zone.",
                 },
             })
-        } else if recordCount > 0 {
-            m.log.Debug("  Partial AXFR response from %s (types=%d, lines=%d) — likely refused", ns, recordCount, lineCount)
+        } else if soaCount == 1 {
+            m.log.Debug("  Partial/refused AXFR from %s (single SOA) — not a transfer", ns)
         }
     }
 }
