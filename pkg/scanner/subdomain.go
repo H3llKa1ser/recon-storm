@@ -39,11 +39,16 @@ func (m *SubdomainModule) Run(ctx context.Context, domain string) error {
     os.MkdirAll(outDir, 0755)
 
     // Detect a DNS wildcard up front so we can flag names that only exist
-    // because the zone answers everything. Without this, wildcard zones inflate
-    // the subdomain count with hundreds of non-existent hosts.
-    wildcardIPs := m.detectWildcard(domain)
-    if len(wildcardIPs) > 0 {
-        m.log.Warn("  Wildcard DNS detected for %s (%v) — flagging wildcard hits", domain, setKeys(wildcardIPs))
+    // because the zone answers everything. This requires live DNS queries to the
+    // target's authoritative servers, so it is skipped in passive mode.
+    var wildcardIPs map[string]bool
+    if m.cfg.PassiveOnly {
+        m.log.Info("  Passive mode — skipping active wildcard DNS detection")
+    } else {
+        wildcardIPs = m.detectWildcard(domain)
+        if len(wildcardIPs) > 0 {
+            m.log.Warn("  Wildcard DNS detected for %s (%v) — flagging wildcard hits", domain, setKeys(wildcardIPs))
+        }
     }
 
     var mu sync.Mutex
