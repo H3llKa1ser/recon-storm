@@ -2,9 +2,12 @@ package scanner
 
 import (
     "context"
+    "crypto/rand"
+    "encoding/hex"
     "encoding/json"
     "fmt"
     "io"
+    "net"
     "net/http"
     "os"
     "os/exec"
@@ -35,28 +38,36 @@ func (m *SubdomainModule) Run(ctx context.Context, domain string) error {
     outDir := filepath.Join(m.cfg.OutputDir, domain, "subdomains")
     os.MkdirAll(outDir, 0755)
 
+    // Detect a DNS wildcard up front so we can flag names that only exist
+    // because the zone answers everything. Without this, wildcard zones inflate
+    // the subdomain count with hundreds of non-existent hosts.
+    wildcardIPs := m.detectWildcard(domain)
+    if len(wildcardIPs) > 0 {
+        m.log.Warn("  Wildcard DNS detected for %s (%v) — flagging wildcard hits", domain, setKeys(wildcardIPs))
+    }
+
     var mu sync.Mutex
     allSubs := make(map[string]string)
 
     type subTool struct {
-        name, binary string
-        args         []string
-        outFile      string
+        name, binary  string
+        args          []string
+        outFile       string
         captureStdout bool
     }
 
     tools := []subTool{
         {name: "subfinder", binary: "subfinder",
-            args: []string{"-d", domain, "-all", "-silent", "-o", filepath.Join(outDir, "subfinder.txt")},
+            args:    []string{"-d", domain, "-all", "-silent", "-o", filepath.Join(outDir, "subfinder.txt")},
             outFile: filepath.Join(outDir, "subfinder.txt")},
         {name: "amass", binary: "amass",
-            args: []string{"enum", "-passive", "-d", domain, "-o", filepath.Join(outDir, "amass.txt")},
+            args:    []string{"enum", "-passive", "-d", domain, "-o", filepath.Join(outDir, "amass.txt")},
             outFile: filepath.Join(outDir, "amass.txt")},
         {name: "assetfinder", binary: "assetfinder",
-            args: []string{"--subs-only", domain},
+            args:    []string{"--subs-only", domain},
             outFile: filepath.Join(outDir, "assetfinder.txt"), captureStdout: true},
         {name: "findomain", binary: "findomain",
-            args: []string{"-t", domain, "-u", filepath.Join(outDir, "findomain.txt")},
+            args:    []string{"-t", domain, "-u", filepath.Join(outDir, "findomain.txt")},
             outFile: filepath.Join(outDir, "findomain.txt")},
     }
 
@@ -86,15 +97,20 @@ func (m *SubdomainModule) Run(ctx context.Context, domain string) error {
             }
 
             subs := readLines(t.outFile)
+            added := 0
             mu.Lock()
             for _, sub := range subs {
                 sub = strings.TrimSpace(strings.ToLower(sub))
-                if sub != "" && strings.HasSuffix(sub, domain) {
-                    allSubs[sub] = t.name
+                sub = strings.TrimPrefix(sub, "*.")
+                if sub != "" && isInScope(sub, domain) {
+                    if _, exists := allSubs[sub]; !exists {
+                        allSubs[sub] = t.name
+                        added++
+                    }
                 }
             }
             mu.Unlock()
-            m.log.Info("  %s found %d subdomains", t.name, len(subs))
+            m.log.Info("  %s contributed %d in-scope subdomains", t.name, added)
         }()
     }
     wg.Wait()
@@ -102,9 +118,13 @@ func (m *SubdomainModule) Run(ctx context.Context, domain string) error {
     // crt.sh with proper JSON parsing
     m.log.Info("  Querying crt.sh...")
     crtSubs := m.queryCrtSh(ctx, domain)
+    mu.Lock()
     for _, sub := range crtSubs {
-        allSubs[sub] = "crt.sh"
+        if _, exists := allSubs[sub]; !exists {
+            allSubs[sub] = "crt.sh"
+        }
     }
+    mu.Unlock()
 
     // Deduplicate and sort
     uniqueSubs := make([]string, 0, len(allSubs))
@@ -121,21 +141,74 @@ func (m *SubdomainModule) Run(ctx context.Context, domain string) error {
     }
     defer f.Close()
 
+    wildcardCount := 0
     for _, sub := range uniqueSubs {
         fmt.Fprintln(f, sub)
+
+        severity := "info"
+        meta := map[string]string{"source": allSubs[sub]}
+
+        // If this name resolves only to the wildcard address(es), mark it so the
+        // report and downstream stats can treat it with suspicion.
+        if len(wildcardIPs) > 0 && m.resolvesOnlyToWildcard(sub, wildcardIPs) {
+            meta["wildcard"] = "true"
+            wildcardCount++
+        }
+
         m.state.AddFinding(state.Finding{
             Type: "subdomain", Value: sub, Source: allSubs[sub],
-            Domain: domain, Severity: "info",
-            Metadata: map[string]string{"source": allSubs[sub]},
+            Domain: domain, Severity: severity,
+            Metadata: meta,
         })
     }
 
-    m.state.UpdateStats(func(s *state.ScanStats) {
-        s.TotalSubdomains += len(uniqueSubs)
-    })
+    if wildcardCount > 0 {
+        m.log.Warn("  %d/%d subdomains resolve only to the wildcard address", wildcardCount, len(uniqueSubs))
+    }
+
+    // Stats are recomputed from findings at report time; no manual increment here
+    // (prevents double-counting on resume and across sources).
 
     m.log.Success("  Total unique subdomains: %d → %s", len(uniqueSubs), finalFile)
     return nil
+}
+
+// detectWildcard resolves several random non-existent hostnames. If they answer,
+// the zone is a wildcard and their answer set is the wildcard address pool.
+func (m *SubdomainModule) detectWildcard(domain string) map[string]bool {
+    ips := make(map[string]bool)
+    resolver := &net.Resolver{}
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    for i := 0; i < 3; i++ {
+        probe := fmt.Sprintf("reconstorm-wc-%s.%s", randHex(10), domain)
+        addrs, err := resolver.LookupHost(ctx, probe)
+        if err != nil {
+            continue
+        }
+        for _, a := range addrs {
+            ips[a] = true
+        }
+    }
+    return ips
+}
+
+func (m *SubdomainModule) resolvesOnlyToWildcard(host string, wildcard map[string]bool) bool {
+    resolver := &net.Resolver{}
+    ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+    defer cancel()
+
+    addrs, err := resolver.LookupHost(ctx, host)
+    if err != nil || len(addrs) == 0 {
+        return false // doesn't resolve at all -> not a wildcard artifact per se
+    }
+    for _, a := range addrs {
+        if !wildcard[a] {
+            return false // resolves to something real
+        }
+    }
+    return true
 }
 
 // queryCrtSh uses proper JSON parsing instead of string splitting
@@ -148,7 +221,7 @@ func (m *SubdomainModule) queryCrtSh(ctx context.Context, domain string) []strin
         m.log.Debug("  crt.sh request error: %v", err)
         return nil
     }
-    req.Header.Set("User-Agent", "ReconStorm/2.0")
+    req.Header.Set("User-Agent", "ReconStorm/2.1")
 
     resp, err := client.Do(req)
     if err != nil {
@@ -168,9 +241,8 @@ func (m *SubdomainModule) queryCrtSh(ctx context.Context, domain string) []strin
         return nil
     }
 
-    // Proper JSON parsing
     var entries []struct {
-        NameValue string `json:"name_value"`
+        NameValue  string `json:"name_value"`
         CommonName string `json:"common_name"`
     }
 
@@ -182,26 +254,44 @@ func (m *SubdomainModule) queryCrtSh(ctx context.Context, domain string) []strin
     seen := make(map[string]bool)
     var subs []string
 
+    add := func(name string) {
+        name = strings.TrimSpace(strings.ToLower(name))
+        name = strings.TrimPrefix(name, "*.")
+        if name != "" && !seen[name] && isInScope(name, domain) {
+            seen[name] = true
+            subs = append(subs, name)
+        }
+    }
+
     for _, entry := range entries {
-        // name_value can contain multiple names separated by newlines
-        names := strings.Split(entry.NameValue, "\n")
-        for _, name := range names {
-            name = strings.TrimSpace(strings.ToLower(name))
-            name = strings.TrimPrefix(name, "*.")
-            if name != "" && !seen[name] && strings.HasSuffix(name, domain) {
-                seen[name] = true
-                subs = append(subs, name)
-            }
+        for _, name := range strings.Split(entry.NameValue, "\n") {
+            add(name)
         }
-        // Also check common_name
-        cn := strings.TrimSpace(strings.ToLower(entry.CommonName))
-        cn = strings.TrimPrefix(cn, "*.")
-        if cn != "" && !seen[cn] && strings.HasSuffix(cn, domain) {
-            seen[cn] = true
-            subs = append(subs, cn)
-        }
+        add(entry.CommonName)
     }
 
     m.log.Info("  crt.sh found %d subdomains", len(subs))
     return subs
+}
+
+// isInScope guards against the HasSuffix bug where "notexample.com" matches
+// "example.com". A name is in scope only if it equals the domain or ends with
+// ".<domain>".
+func isInScope(name, domain string) bool {
+    return name == domain || strings.HasSuffix(name, "."+domain)
+}
+
+func randHex(n int) string {
+    b := make([]byte, n/2+1)
+    rand.Read(b)
+    return hex.EncodeToString(b)[:n]
+}
+
+func setKeys(m map[string]bool) []string {
+    out := make([]string, 0, len(m))
+    for k := range m {
+        out = append(out, k)
+    }
+    sort.Strings(out)
+    return out
 }
