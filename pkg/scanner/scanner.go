@@ -112,6 +112,22 @@ func (s *Scanner) Run() error {
         concurrency = len(s.cfg.Domains)
     }
 
+    // Keep the outbound thread budget global. Each domain's modules read
+    // cfg.Threads independently, so without this the real concurrency would be
+    // domainConcurrency * Threads — enough to trip rate limits / bot defenses
+    // and skew results. Divide the budget across the domains running in parallel.
+    if concurrency > 1 {
+        perDomain := s.cfg.Threads / concurrency
+        if perDomain < 1 {
+            perDomain = 1
+        }
+        if perDomain != s.cfg.Threads {
+            s.log.Info("Thread budget: %d total across %d parallel domains → %d per domain",
+                s.cfg.Threads, concurrency, perDomain)
+            s.cfg.Threads = perDomain
+        }
+    }
+
     var (
         errMu sync.Mutex
         errs  []error
