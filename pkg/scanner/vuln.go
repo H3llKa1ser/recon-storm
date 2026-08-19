@@ -64,7 +64,7 @@ func (m *VulnModule) runNuclei(ctx context.Context, domain, outDir, liveURLsFile
     nucleiOut := filepath.Join(outDir, "nuclei_results.txt")
     nucleiJSON := filepath.Join(outDir, "nuclei_results.jsonl")
 
-    cmd := exec.CommandContext(ctx, "nuclei",
+    args := []string{
         "-l", liveURLsFile,
         "-severity", "low,medium,high,critical",
         "-c", fmt.Sprintf("%d", m.cfg.Threads),
@@ -76,8 +76,15 @@ func (m *VulnModule) runNuclei(ctx context.Context, domain, outDir, liveURLsFile
         "-jsonl", nucleiJSON,
         "-silent",
         "-stats",
-        "-etags", "ssl,dns",
-    )
+    }
+    // Only exclude template tags when the operator asks. Previously ssl,dns were
+    // excluded unconditionally, which silently hid TLS and DNS findings.
+    if tags := strings.TrimSpace(m.cfg.NucleiExcludeTags); tags != "" {
+        args = append(args, "-etags", tags)
+        m.log.Info("  Excluding nuclei tags: %s", tags)
+    }
+
+    cmd := exec.CommandContext(ctx, "nuclei", args...)
 
     out, err := cmd.CombinedOutput()
     if err != nil {
