@@ -66,46 +66,33 @@
 
     ./reconstorm -d example.com -modules subdomains,dns,web
 
-# With API keys
+# Resume an interrupted scan
 
-    ./reconstorm -d example.com -shodan-key KEY -vt-key KEY
+    ./reconstorm -d example.com -o ./recon-example.com -resume
 
-# Resume interrupted scan
+# Scan several domains in parallel (thread budget is split across them)
 
-    ./reconstorm -d example.com -o ./recon-example.com-20260311 -resume
+    ./reconstorm -dL targets.txt -domain-concurrency 3 -t 90
 
-# Install Python dependencies
+# Exclude noisy nuclei template tags (default: run all tags)
 
-    pip install shodan censys python-dotenv requests colorama pyyaml schedule
-    
-# Check which tools are installed
+    ./reconstorm -d example.com -nuclei-exclude-tags ssl,dns
 
-    python3 recon_storm.py --check-tools
-    
-# Print full installation guide
+### 4) Flags
 
-    python3 recon_storm.py --install-guide
-    
-# Generate config file template
+| Flag | Description |
+|------|-------------|
+| `-d` | Target domain |
+| `-dL` | File containing a list of domains |
+| `-o` | Output directory |
+| `-t` | Threads (global budget; split across parallel domains) |
+| `-domain-concurrency` | Domains to scan in parallel with `-dL` (default 1) |
+| `-passive` | Passive only — no active packets toward the target |
+| `-modules` | Comma-separated modules to run (subdomains,dns,ports,web,endpoints,vulns,secrets,screenshots) |
+| `-nuclei-exclude-tags` | Comma-separated nuclei tags to exclude (default: none) |
+| `-resume` | Resume a previous scan from its state.json |
+| `-timeout` | Global scan timeout |
 
-    python3 recon_storm.py --generate-config
-    
-# Full scan against a target
-
-    python3 recon_storm.py --target example.com
-    
-# Run only stages 1, 2, 3
-
-    python3 recon_storm.py --target example.com --stages 1,2,3
-    
-# Full scan + continuous monitoring every 4 hours
-
-    python3 recon_storm.py --target example.com --monitor --interval 4
-    
-# Scan with custom config
-
-    python3 recon_storm.py --target example.com --config recon_storm_config.yaml -v
-    
-# Scan multiple targets from a file
-
-    python3 recon_storm.py --target-list targets.txt
+> Note: reports redact discovered secrets to the last 4 characters. The full
+> value is kept only in the local `state.json`, so a shared report never carries
+> live credentials.
