@@ -38,7 +38,13 @@ func (m *DNSModule) Run(ctx context.Context, domain string) error {
     subCount := countFileLines(subsFile)
     m.log.Info("  DNS module processing %d subdomains", subCount)
 
-    if toolExists("dnsx") {
+    // Active DNS resolution (dnsx) sends queries to the target's authoritative
+    // nameservers. In passive mode we skip it and treat the enumerated
+    // subdomains as the host set instead, so -passive stays packet-free toward
+    // the target.
+    activeResolution := !m.cfg.PassiveOnly && toolExists("dnsx")
+
+    if activeResolution {
         m.log.Info("  Running dnsx for DNS resolution...")
 
         resolvedFile := filepath.Join(outDir, "dnsx_resolved.txt")
@@ -99,20 +105,28 @@ func (m *DNSModule) Run(ctx context.Context, domain string) error {
         writeLines(liveFile, liveHosts)
         m.log.Info("  %d unique live hosts written to %s", len(liveHosts), filepath.Base(liveFile))
     } else {
-        m.log.Warn("  dnsx not found — skipping active DNS resolution")
-        m.log.Warn("  Install: go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest")
+        if m.cfg.PassiveOnly {
+            m.log.Info("  Passive mode — skipping active DNS resolution (dnsx)")
+        } else {
+            m.log.Warn("  dnsx not found — skipping active DNS resolution")
+            m.log.Warn("  Install: go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest")
+        }
 
         // Fallback: treat enumerated subdomains as live hosts AND record them as
         // findings so the recomputed live-host stat stays consistent.
         subsData := readLines(subsFile)
         if len(subsData) > 0 {
+            note := "unresolved fallback (dnsx missing)"
+            if m.cfg.PassiveOnly {
+                note = "unresolved (passive mode — no active resolution)"
+            }
             liveFile := filepath.Join(outDir, "live_hosts.txt")
             writeLines(liveFile, subsData)
             for _, h := range subsData {
                 m.state.AddFinding(state.Finding{
                     Type: "dns_resolved", Value: h, Source: "fallback",
                     Domain: domain, Severity: "info",
-                    Metadata: map[string]string{"note": "unresolved fallback (dnsx missing)"},
+                    Metadata: map[string]string{"note": note},
                 })
             }
             m.log.Info("  Fallback: using %d subdomains as live hosts", len(subsData))
