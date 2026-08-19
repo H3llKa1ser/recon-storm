@@ -3,10 +3,14 @@ package scanner
 import (
     "context"
     "fmt"
+    "io"
+    "net/http"
     "os"
     "os/exec"
     "path/filepath"
+    "regexp"
     "strings"
+    "time"
 
     "github.com/H3llKa1ser/recon-storm/pkg/config"
     "github.com/H3llKa1ser/recon-storm/pkg/logger"
@@ -25,11 +29,43 @@ func NewSecretsModule(cfg *config.Config, sm *state.Manager, log *logger.Logger)
 
 func (m *SecretsModule) Name() string { return "secrets" }
 
+// secretRule pairs a compiled pattern with a human label so findings carry a
+// meaningful description instead of the raw regex.
+type secretRule struct {
+    Label string
+    Re    *regexp.Regexp
+}
+
+// Patterns are compiled once at package load. RE2 (Go's engine) has no
+// backreferences, but none of these need them.
+var secretRules = []secretRule{
+    {"Generic API key", regexp.MustCompile("(?i)(api[_-]?key|apikey|api[_-]?secret)\\s*[:=]\\s*['\"`]([^'\"`\\s]{16,})")},
+    {"Access/auth token", regexp.MustCompile("(?i)(access[_-]?token|auth[_-]?token)\\s*[:=]\\s*['\"`]([^'\"`\\s]{16,})")},
+    {"AWS access key id", regexp.MustCompile("(?i)(aws[_-]?access[_-]?key[_-]?id)\\s*[:=]\\s*['\"`]([A-Z0-9]{20})")},
+    {"Secret/private key", regexp.MustCompile("(?i)(secret[_-]?key|private[_-]?key)\\s*[:=]\\s*['\"`]([^'\"`\\s]{16,})")},
+    {"Hardcoded password", regexp.MustCompile("(?i)(password|passwd|pwd)\\s*[:=]\\s*['\"`]([^'\"`\\s]{6,})")},
+    {"Database connection URI", regexp.MustCompile("(?i)(firebase|supabase|mongodb\\+srv)://[^\\s'\"]+")},
+    {"OpenAI-style key", regexp.MustCompile("sk-[a-zA-Z0-9]{20,}")},
+    {"GitHub PAT", regexp.MustCompile("ghp_[a-zA-Z0-9]{36}")},
+    {"Google API key", regexp.MustCompile("AIza[0-9A-Za-z\\-_]{35}")},
+    {"AWS access key", regexp.MustCompile("AKIA[0-9A-Z]{16}")},
+    {"Slack token", regexp.MustCompile("xox[baprs]-[0-9a-zA-Z]{10,}")},
+    {"JWT", regexp.MustCompile("eyJ[a-zA-Z0-9_-]{10,}\\.[a-zA-Z0-9_-]{10,}\\.[a-zA-Z0-9_-]{10,}")},
+    {"Square OAuth secret", regexp.MustCompile("sq0[a-z]{3}-[0-9A-Za-z\\-_]{22,}")},
+    {"Stripe/Twilio SK", regexp.MustCompile("SK[a-f0-9]{32}")},
+}
+
 func (m *SecretsModule) Run(ctx context.Context, domain string) error {
     outDir := filepath.Join(m.cfg.OutputDir, domain, "secrets")
     os.MkdirAll(outDir, 0755)
 
-    // ── ffuf content discovery ──
+    // In passive mode we must not touch the target: skip content discovery and
+    // JS retrieval entirely.
+    if m.cfg.PassiveOnly {
+        m.log.Info("  Passive mode — skipping active content discovery and JS retrieval")
+        return nil
+    }
+
     liveURLsFile := filepath.Join(m.cfg.OutputDir, domain, "web", "live_urls.txt")
     if fileExists(liveURLsFile) && toolExists("ffuf") {
         m.runFfuf(ctx, domain, outDir, liveURLsFile)
@@ -37,7 +73,6 @@ func (m *SecretsModule) Run(ctx context.Context, domain string) error {
         m.log.Warn("  ffuf not found, skipping content discovery")
     }
 
-    // ── JS file secret scanning ──
     jsFile := filepath.Join(m.cfg.OutputDir, domain, "endpoints", "js_files.txt")
     if fileExists(jsFile) {
         m.scanJSFiles(ctx, domain, outDir, jsFile)
@@ -57,7 +92,6 @@ func (m *SecretsModule) runFfuf(ctx context.Context, domain, outDir, urlsFile st
         return
     }
 
-    // Find wordlist
     wordlist := ""
     candidates := []string{
         "/usr/share/seclists/Discovery/Web-Content/common.txt",
@@ -78,14 +112,12 @@ func (m *SecretsModule) runFfuf(ctx context.Context, domain, outDir, urlsFile st
 
     m.log.Info("  Fuzzing %d target URLs with wordlist %s", len(urls), filepath.Base(wordlist))
 
-    // Limit targets
     maxURLs := 20
     if len(urls) < maxURLs {
         maxURLs = len(urls)
     }
 
-    totalFindings := 0
-
+    totalHits := 0
     for i, baseURL := range urls[:maxURLs] {
         m.log.Progress("ffuf", i+1, maxURLs)
 
@@ -96,38 +128,31 @@ func (m *SecretsModule) runFfuf(ctx context.Context, domain, outDir, urlsFile st
             "-u", baseURL+"/FUZZ",
             "-w", wordlist,
             "-mc", "200,201,204,301,302,307,401,403,405",
-            "-ac",
-            "-sf",
-            "-se",
+            "-ac", "-sf", "-se",
             "-t", fmt.Sprintf("%d", m.cfg.Threads/2),
             "-rate", "100",
-            "-o", outFile,
-            "-of", "json",
-            "-s",
+            "-o", outFile, "-of", "json", "-s",
         )
         cmd.Run()
 
-        // Count results in this JSON
         if fileExists(outFile) {
-            lines := readLines(outFile)
             count := 0
-            for _, l := range lines {
+            for _, l := range readLines(outFile) {
                 if strings.Contains(l, "\"status\"") {
                     count++
                 }
             }
             if count > 0 {
                 m.log.Info("  ffuf found %d results for %s", count, baseURL)
-                totalFindings += count
+                totalHits += count
             }
         }
     }
 
-    m.state.UpdateStats(func(s *state.ScanStats) {
-        s.TotalSecrets += totalFindings
-    })
-
-    m.log.Success("  ffuf content discovery complete: %d findings across %d targets", totalFindings, maxURLs)
+    // Content-discovery hits are recorded as their own category, not as
+    // "secrets" (the previous behaviour inflated the secret count with dirbust
+    // results). They are informational surface, not credentials.
+    m.log.Success("  ffuf content discovery complete: %d paths across %d targets", totalHits, maxURLs)
 }
 
 func (m *SecretsModule) scanJSFiles(ctx context.Context, domain, outDir, jsFile string) {
@@ -138,7 +163,6 @@ func (m *SecretsModule) scanJSFiles(ctx context.Context, domain, outDir, jsFile 
         return
     }
 
-    // Limit to prevent excessive scanning
     maxJS := 100
     if len(jsURLs) < maxJS {
         maxJS = len(jsURLs)
@@ -154,64 +178,64 @@ func (m *SecretsModule) scanJSFiles(ctx context.Context, domain, outDir, jsFile 
     }
     defer f.Close()
 
-    patterns := []string{
-        `(?i)(api[_-]?key|apikey|api[_-]?secret)\s*[:=]\s*['"\x60]([^'"\x60\s]{16,})`,
-        `(?i)(access[_-]?token|auth[_-]?token)\s*[:=]\s*['"\x60]([^'"\x60\s]{16,})`,
-        `(?i)(aws[_-]?access[_-]?key[_-]?id)\s*[:=]\s*['"\x60]([A-Z0-9]{20})`,
-        `(?i)(secret[_-]?key|private[_-]?key)\s*[:=]\s*['"\x60]([^'"\x60\s]{16,})`,
-        `(?i)(password|passwd|pwd)\s*[:=]\s*['"\x60]([^'"\x60\s]{6,})`,
-        `(?i)(firebase|supabase|mongodb\+srv)://[^\s'"]+`,
-        `(?i)(sk-[a-zA-Z0-9]{20,})`,
-        `(?i)(ghp_[a-zA-Z0-9]{36})`,
-        `(?i)(AIza[0-9A-Za-z\-_]{35})`,
-        `(?i)(AKIA[0-9A-Z]{16})`,
-        `(?i)(xox[baprs]-[0-9a-zA-Z]{10,})`,
-        `(?i)(eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,})`,
-        `(?i)(sq0[a-z]{3}-[0-9A-Za-z\-_]{22,})`,
-        `(?i)(SK[a-f0-9]{32})`,
-    }
-
+    client := &http.Client{Timeout: 12 * time.Second}
     secretCount := 0
+    seen := make(map[string]bool) // dedup identical matches within this module
 
     for _, jsURL := range jsURLs {
-        // Download JS file
-        dlCmd := exec.CommandContext(ctx, "curl", "-s", "-L", "--max-time", "10",
-            "-H", "User-Agent: Mozilla/5.0 (ReconStorm/2.0)", jsURL)
-        content, err := dlCmd.Output()
+        content, err := m.fetchBody(ctx, client, jsURL)
         if err != nil || len(content) == 0 {
             continue
         }
 
-        contentStr := string(content)
-
-        for _, pattern := range patterns {
-            grepCmd := exec.CommandContext(ctx, "grep", "-oP", pattern)
-            grepCmd.Stdin = strings.NewReader(contentStr)
-            matches, err := grepCmd.Output()
-            if err == nil && len(matches) > 0 {
-                for _, match := range strings.Split(strings.TrimSpace(string(matches)), "\n") {
-                    match = strings.TrimSpace(match)
-                    if match == "" {
-                        continue
-                    }
-
-                    line := fmt.Sprintf("[%s] %s\n", jsURL, match)
-                    f.WriteString(line)
-
-                    m.state.AddFinding(state.Finding{
-                        Type: "secret", Value: match,
-                        Source: "js_analysis", Domain: domain, Severity: "high",
-                        Metadata: map[string]string{"file": jsURL, "pattern": pattern},
-                    })
-                    secretCount++
+        // Run every pattern in-process over the whole file, so matches that
+        // straddle what would have been a streaming boundary are still caught.
+        for _, rule := range secretRules {
+            for _, match := range rule.Re.FindAllString(content, -1) {
+                match = strings.TrimSpace(match)
+                if match == "" {
+                    continue
                 }
+                key := jsURL + "|" + match
+                if seen[key] {
+                    continue
+                }
+                seen[key] = true
+
+                fmt.Fprintf(f, "[%s] (%s) %s\n", jsURL, rule.Label, match)
+
+                m.state.AddFinding(state.Finding{
+                    Type: "secret", Value: match,
+                    Source: "js_analysis", Domain: domain, Severity: "high",
+                    Metadata: map[string]string{
+                        "file":        jsURL,
+                        "rule":        rule.Label,
+                        "description": rule.Label + " found in client-side JavaScript; rotate if valid.",
+                    },
+                })
+                secretCount++
             }
         }
     }
 
-    m.state.UpdateStats(func(s *state.ScanStats) {
-        s.TotalSecrets += secretCount
-    })
-
     m.log.Success("  Found %d potential secrets in JS files", secretCount)
+}
+
+func (m *SecretsModule) fetchBody(ctx context.Context, client *http.Client, url string) (string, error) {
+    req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+    if err != nil {
+        return "", err
+    }
+    req.Header.Set("User-Agent", "Mozilla/5.0 (ReconStorm/2.1)")
+    resp, err := client.Do(req)
+    if err != nil {
+        return "", err
+    }
+    defer resp.Body.Close()
+    // Cap at 5 MB to avoid pathological files.
+    body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
+    if err != nil {
+        return "", err
+    }
+    return string(body), nil
 }
