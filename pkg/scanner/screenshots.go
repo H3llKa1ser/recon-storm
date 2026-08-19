@@ -6,6 +6,7 @@ import (
     "os"
     "os/exec"
     "path/filepath"
+    "regexp"
 
     "github.com/H3llKa1ser/recon-storm/pkg/config"
     "github.com/H3llKa1ser/recon-storm/pkg/logger"
@@ -45,34 +46,104 @@ func (m *ScreenshotsModule) Run(ctx context.Context, domain string) error {
         return nil
     }
 
-    m.log.Info("  Running gowitness on %d URLs...", urlCount)
+    // gowitness v3 rewrote the CLI: the old `gowitness file -f … -P …` became
+    // `gowitness scan file -f … --screenshot-path …`. Detect the major version
+    // so a v3 install (what `go install …@latest` now pulls) doesn't silently
+    // capture nothing.
+    major := gowitnessMajor(ctx)
+    m.log.Info("  Running gowitness (detected v%d) on %d URLs...", major, urlCount)
 
-    cmd := exec.CommandContext(ctx, "gowitness",
-        "file",
-        "-f", liveURLsFile,
-        "-P", outDir,
-        "--threads", fmt.Sprintf("%d", m.cfg.Threads),
-        "--timeout", "15",
-    )
+    var cmd *exec.Cmd
+    if major >= 3 {
+        cmd = exec.CommandContext(ctx, "gowitness",
+            "scan", "file",
+            "-f", liveURLsFile,
+            "--screenshot-path", outDir,
+            "--threads", fmt.Sprintf("%d", m.cfg.Threads),
+            "--timeout", "15",
+            "--write-db=false",
+        )
+    } else {
+        cmd = exec.CommandContext(ctx, "gowitness",
+            "file",
+            "-f", liveURLsFile,
+            "-P", outDir,
+            "--threads", fmt.Sprintf("%d", m.cfg.Threads),
+            "--timeout", "15",
+        )
+    }
 
     out, err := cmd.CombinedOutput()
     if err != nil {
         m.log.Warn("  gowitness error: %v — %s", err, string(out))
-    }
-
-    // Count screenshots
-    entries, _ := os.ReadDir(outDir)
-    count := 0
-    for _, e := range entries {
-        if !e.IsDir() {
-            count++
+        // If v3 rejected our flags (or vice-versa), retry with the other form
+        // before giving up, so a wrong version guess still produces output.
+        if alt := m.altCommand(ctx, major, liveURLsFile, outDir); alt != nil {
+            m.log.Info("  Retrying with alternate gowitness CLI form...")
+            if out2, err2 := alt.CombinedOutput(); err2 != nil {
+                m.log.Warn("  gowitness retry error: %v — %s", err2, string(out2))
+            }
         }
     }
 
+    count := countImages(outDir)
     m.state.UpdateStats(func(s *state.ScanStats) {
         s.TotalScreenshots += count
     })
 
     m.log.Success("  Captured %d screenshots", count)
     return nil
+}
+
+// altCommand returns the opposite-version invocation for a best-effort retry.
+func (m *ScreenshotsModule) altCommand(ctx context.Context, triedMajor int, list, outDir string) *exec.Cmd {
+    if triedMajor >= 3 {
+        return exec.CommandContext(ctx, "gowitness",
+            "file", "-f", list, "-P", outDir,
+            "--threads", fmt.Sprintf("%d", m.cfg.Threads), "--timeout", "15")
+    }
+    return exec.CommandContext(ctx, "gowitness",
+        "scan", "file", "-f", list, "--screenshot-path", outDir,
+        "--threads", fmt.Sprintf("%d", m.cfg.Threads), "--timeout", "15", "--write-db=false")
+}
+
+var gowitnessVerRe = regexp.MustCompile(`v?(\d+)\.\d+`)
+
+// gowitnessMajor best-effort parses the installed gowitness major version.
+// Defaults to 3 (current latest) when detection fails.
+func gowitnessMajor(ctx context.Context) int {
+    out, err := exec.CommandContext(ctx, "gowitness", "version").CombinedOutput()
+    if err != nil {
+        if out2, err2 := exec.CommandContext(ctx, "gowitness", "--version").CombinedOutput(); err2 == nil {
+            out = out2
+        }
+    }
+    if mm := gowitnessVerRe.FindStringSubmatch(string(out)); len(mm) == 2 {
+        switch mm[1] {
+        case "1":
+            return 1
+        case "2":
+            return 2
+        case "3":
+            return 3
+        case "4":
+            return 4
+        }
+    }
+    return 3 // assume modern CLI
+}
+
+func countImages(dir string) int {
+    count := 0
+    filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+        if err != nil || info == nil || info.IsDir() {
+            return nil
+        }
+        switch filepath.Ext(info.Name()) {
+        case ".png", ".jpg", ".jpeg":
+            count++
+        }
+        return nil
+    })
+    return count
 }
