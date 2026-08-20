@@ -9,10 +9,12 @@ import (
     "fmt"
     "io"
     "net/http"
+    "net/url"
     "os"
     "os/exec"
     "path/filepath"
     "regexp"
+    "sort"
     "strings"
     "time"
 
@@ -37,23 +39,150 @@ func (m *VulnModule) Run(ctx context.Context, domain string) error {
     outDir := filepath.Join(m.cfg.OutputDir, domain, "vulns")
     os.MkdirAll(outDir, 0755)
 
-    liveURLsFile := filepath.Join(m.cfg.OutputDir, domain, "web", "live_urls.txt")
-    if !fileExists(liveURLsFile) {
-        m.log.Warn("  No live URLs found — skipping vulnerability scan")
+    // Scan the whole discovered application surface: the httpx root hosts PLUS
+    // the crawled endpoints. Previously only the roots were scanned, so deep
+    // paths and parameterized URLs that the crawler found were thrown away —
+    // which is why a deliberately vulnerable app returned almost nothing.
+    targets := m.collectTargets(domain)
+    if len(targets) == 0 {
+        m.log.Warn("  No scan targets (web/endpoints produced nothing) — skipping vulnerability scan")
         return nil
     }
 
-    urlCount := countFileLines(liveURLsFile)
+    targetsFile := filepath.Join(outDir, "scan_targets.txt")
+    writeLines(targetsFile, targets)
+    origins := uniqueOrigins(targets)
+    m.log.Info("  Scan surface: %d URLs across %d origins (roots + crawled endpoints)", len(targets), len(origins))
 
     if toolExists("nuclei") {
-        m.runNuclei(ctx, domain, outDir, liveURLsFile, urlCount)
+        m.runNuclei(ctx, domain, outDir, targetsFile, len(targets))
+
+        // DAST parameter fuzzing (SQLi / XSS / SSTI / LFI / etc.) against URLs
+        // that carry query parameters — the high-signal surface on most
+        // vulnerable web apps. Opt-in because it is active and slower.
+        if m.cfg.Dast && !m.cfg.PassiveOnly {
+            params := paramURLs(targets)
+            if len(params) > 0 {
+                paramFile := filepath.Join(outDir, "param_urls.txt")
+                writeLines(paramFile, params)
+                m.runNucleiDAST(ctx, domain, outDir, paramFile, len(params))
+            } else {
+                m.log.Info("  DAST enabled but no parameterized URLs were discovered")
+            }
+        } else if !m.cfg.Dast {
+            m.log.Info("  DAST fuzzing disabled — enable with -dast for parameter-level testing")
+        }
     } else {
         m.log.Warn("  Nuclei not found — install for comprehensive vuln scanning")
     }
 
-    m.customChecks(ctx, domain, outDir, liveURLsFile)
+    // Sensitive-path checks append fixed paths to a base, so they run once per
+    // unique origin rather than per crawled URL.
+    m.customChecks(ctx, domain, outDir, origins)
 
     return nil
+}
+
+// collectTargets merges the root hosts and crawled endpoints into a single,
+// deduplicated, in-scope target list. Out-of-scope hosts the crawler may have
+// picked up (CDNs, third-party assets) are dropped so scanning stays within
+// authorization.
+func (m *VulnModule) collectTargets(domain string) []string {
+    const maxTargets = 10000
+    seen := make(map[string]bool)
+    out := make([]string, 0, 256)
+
+    add := func(raw string) bool {
+        raw = strings.TrimSpace(raw)
+        if raw == "" || !(strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://")) {
+            return true
+        }
+        u, err := url.Parse(raw)
+        if err != nil {
+            return true
+        }
+        if !isInScope(strings.ToLower(u.Hostname()), domain) {
+            return true
+        }
+        norm := strings.TrimRight(raw, "/")
+        if norm == "" {
+            norm = raw
+        }
+        if seen[norm] {
+            return true
+        }
+        seen[norm] = true
+        out = append(out, norm)
+        return len(out) < maxTargets
+    }
+
+    for _, f := range []string{
+        filepath.Join(m.cfg.OutputDir, domain, "web", "live_urls.txt"),
+        filepath.Join(m.cfg.OutputDir, domain, "endpoints", "all_endpoints.txt"),
+    } {
+        if !fileExists(f) {
+            continue
+        }
+        for _, l := range readLines(f) {
+            if !add(l) {
+                m.log.Warn("  Scan target cap reached (%d) — truncating surface", maxTargets)
+                return out
+            }
+        }
+    }
+    return out
+}
+
+// uniqueOrigins reduces a URL list to distinct scheme://host[:port] roots.
+func uniqueOrigins(urls []string) []string {
+    seen := make(map[string]bool)
+    out := make([]string, 0, 16)
+    for _, raw := range urls {
+        u, err := url.Parse(raw)
+        if err != nil || u.Host == "" {
+            continue
+        }
+        origin := u.Scheme + "://" + u.Host
+        if !seen[origin] {
+            seen[origin] = true
+            out = append(out, origin)
+        }
+    }
+    return out
+}
+
+// paramURLs selects URLs that carry query parameters, collapsing ones that
+// differ only in parameter values (…/item?id=1 and …/item?id=2 share a
+// signature) so DAST fuzzes each distinct parameter shape once.
+func paramURLs(urls []string) []string {
+    const capN = 2000
+    seen := make(map[string]bool)
+    out := make([]string, 0, 64)
+    for _, raw := range urls {
+        u, err := url.Parse(raw)
+        if err != nil {
+            continue
+        }
+        q := u.Query()
+        if len(q) == 0 {
+            continue
+        }
+        keys := make([]string, 0, len(q))
+        for k := range q {
+            keys = append(keys, k)
+        }
+        sort.Strings(keys)
+        sig := u.Scheme + "://" + u.Host + u.Path + "?" + strings.Join(keys, "&")
+        if seen[sig] {
+            continue
+        }
+        seen[sig] = true
+        out = append(out, raw)
+        if len(out) >= capN {
+            break
+        }
+    }
+    return out
 }
 
 // ── Nuclei ───────────────────────────────────────────────
@@ -133,6 +262,41 @@ func (m *VulnModule) parseNucleiResults(jsonFile string, domain string) {
     }
 }
 
+// runNucleiDAST fuzzes parameterized URLs with nuclei's DAST templates to find
+// injection-class bugs (SQLi, XSS, SSTI, LFI, command injection) that only
+// surface when parameters are manipulated.
+func (m *VulnModule) runNucleiDAST(ctx context.Context, domain, outDir, paramFile string, count int) {
+    m.log.Info("  Running Nuclei DAST fuzzing on %d parameterized URLs...", count)
+
+    dastOut := filepath.Join(outDir, "nuclei_dast.txt")
+    dastJSON := filepath.Join(outDir, "nuclei_dast.jsonl")
+
+    args := []string{
+        "-l", paramFile,
+        "-dast",
+        "-c", fmt.Sprintf("%d", m.cfg.Threads),
+        "-rl", "150",
+        "-timeout", "10",
+        "-retries", "1",
+        "-o", dastOut,
+        "-jsonl", dastJSON,
+        "-silent",
+        "-stats",
+    }
+    if tags := strings.TrimSpace(m.cfg.NucleiExcludeTags); tags != "" {
+        args = append(args, "-etags", tags)
+    }
+
+    cmd := exec.CommandContext(ctx, "nuclei", args...)
+    out, err := cmd.CombinedOutput()
+    if err != nil {
+        m.log.Warn("  Nuclei DAST error: %v — %s", err, strings.TrimSpace(string(out)))
+    }
+
+    m.parseNucleiResults(dastJSON, domain)
+    m.log.Success("  DAST fuzzing found %d results", len(readLines(dastOut)))
+}
+
 // ── Custom Checks with False-Positive Reduction ─────────
 
 type responseFingerprint struct {
@@ -152,8 +316,7 @@ type sensitivePathCheck struct {
     SkipRedirects bool
 }
 
-func (m *VulnModule) customChecks(ctx context.Context, domain, outDir, urlsFile string) {
-    urls := readLines(urlsFile)
+func (m *VulnModule) customChecks(ctx context.Context, domain, outDir string, urls []string) {
     if len(urls) == 0 {
         return
     }
@@ -161,7 +324,7 @@ func (m *VulnModule) customChecks(ctx context.Context, domain, outDir, urlsFile 
     m.log.Info("  Running validated sensitive path checks...")
 
     checks := m.defineChecks()
-    m.log.Info("  Checking %d sensitive paths across %d hosts...", len(checks), len(urls))
+    m.log.Info("  Checking %d sensitive paths across %d origins...", len(checks), len(urls))
 
     client := &http.Client{
         Timeout: 10 * time.Second,
