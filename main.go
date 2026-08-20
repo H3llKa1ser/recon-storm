@@ -35,6 +35,7 @@ func main() {
     threads := flag.Int("t", 50, "Number of concurrent threads")
     domainConcurrency := flag.Int("domain-concurrency", 1, "Number of domains to scan in parallel (with -dL)")
     nucleiExcludeTags := flag.String("nuclei-exclude-tags", "", "Comma-separated nuclei template tags to exclude (e.g. ssl,dns). Empty = run all.")
+    dast := flag.Bool("dast", false, "Enable nuclei DAST parameter fuzzing on discovered parameterized URLs (active, slower)")
     timeout := flag.Duration("timeout", 45*time.Minute, "Global timeout for entire scan")
     moduleTimeout := flag.Duration("module-timeout", 10*time.Minute, "Timeout per scan module")
     skipInstall := flag.Bool("skip-install", false, "Skip tool installation check")
@@ -65,6 +66,7 @@ func main() {
         Threads:           *threads,
         DomainConcurrency: *domainConcurrency,
         NucleiExcludeTags: *nucleiExcludeTags,
+        Dast:              *dast,
         GlobalTimeout:     *timeout,
         ModuleTimeout:     *moduleTimeout,
         SkipInstall:       *skipInstall,
